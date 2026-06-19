@@ -235,7 +235,16 @@ namespace SPTAG
             for (int j = 0; j < m_options.m_iSSDNumberOfThreads; j++) { threads.emplace_back(func); }
             for (auto& thread : threads) { thread.join(); }
             } else {
-                m_versionMap.Load(m_options.m_deleteIDFile, m_index->m_iDataBlockSize, m_index->m_iDataCapacity);
+                if (!m_options.m_deleteIDFile.empty() && fileexists(m_options.m_deleteIDFile.c_str())) {
+                    m_versionMap.Load(m_options.m_deleteIDFile, m_index->m_iDataBlockSize, m_index->m_iDataCapacity);
+                } else {
+                    SizeType versionMapSize = m_options.m_vectorSize;
+                    if (versionMapSize < 0) versionMapSize = m_index->GetNumSamples();
+                    LOG(Helper::LogLevel::LL_Info,
+                        "SPANN delete/version file missing; initializing empty version map for %d vectors.\n",
+                        versionMapSize);
+                    m_versionMap.Initialize(versionMapSize, m_index->m_iDataBlockSize, m_index->m_iDataCapacity);
+                }
             }
 
             if ((m_options.m_useSPDK || m_options.m_useKV) && m_options.m_preReassign) {
@@ -315,6 +324,24 @@ namespace SPTAG
         template<typename T>
         ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool p_searchDeleted) const
         {
+            return SearchIndexInternal(p_query, nullptr, nullptr, 0, p_searchDeleted);
+        }
+
+        template<typename T>
+        ErrorCode Index<T>::SearchIndex(QueryResult& p_query, const IVectorFilter* p_filter, bool p_searchDeleted) const
+        {
+            return SearchIndexInternal(p_query, p_filter, nullptr, 0, p_searchDeleted);
+        }
+
+        template<typename T>
+        ErrorCode Index<T>::SearchIndex(QueryResult& p_query, const std::uint64_t* p_filterBits, std::size_t p_filterWordCount, bool p_searchDeleted) const
+        {
+            return SearchIndexInternal(p_query, nullptr, p_filterBits, p_filterWordCount, p_searchDeleted);
+        }
+
+        template<typename T>
+        ErrorCode Index<T>::SearchIndexInternal(QueryResult& p_query, const IVectorFilter* p_filter, const std::uint64_t* p_filterBits, std::size_t p_filterWordCount, bool p_searchDeleted) const
+        {
             if (!m_bReady) return ErrorCode::EmptyIndex;
 
             COMMON::QueryResultSet<T>* p_queryResults;
@@ -332,6 +359,7 @@ namespace SPTAG
                 }
                 m_workspace->m_deduper.clear();
                 m_workspace->m_postingIDs.clear();
+                VectorFilterScope vectorFilterScope(m_workspace.get(), p_filter, p_filterBits, p_filterWordCount);
 
                 float limitDist = p_queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
                 for (int i = 0; i < p_queryResults->GetResultNum(); ++i)
@@ -340,7 +368,14 @@ namespace SPTAG
                     if (res->VID == -1) break;
                     
                     auto postingID = res->VID;
-                    if (m_vectorTranslateMap.get() != nullptr) res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
+                    auto headDist = res->Dist;
+                    if (m_vectorTranslateMap.get() != nullptr) {
+                        res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
+                        if (!m_workspace->CheckVectorFilter(res->VID)) {
+                            res->VID = -1;
+                            res->Dist = MaxDist;
+                        }
+                    }
                     else {
                         res->VID = -1;
                         res->Dist = MaxDist;
@@ -348,7 +383,7 @@ namespace SPTAG
 
                     // Don't do disk reads for irrelevant pages
                     if (m_workspace->m_postingIDs.size() >= m_options.m_searchInternalResultNum ||
-                        (limitDist > 0.1 && res->Dist > limitDist) ||
+                        (limitDist > 0.1 && headDist > limitDist) ||
                         !m_extraSearcher->CheckValidPosting(postingID))
                         continue;
                     m_workspace->m_postingIDs.emplace_back(postingID);
@@ -378,6 +413,24 @@ namespace SPTAG
         template <typename T>
         ErrorCode Index<T>::SearchDiskIndex(QueryResult& p_query, SearchStats* p_stats) const
         {
+            return SearchDiskIndexInternal(p_query, nullptr, nullptr, 0, p_stats);
+        }
+
+        template <typename T>
+        ErrorCode Index<T>::SearchDiskIndex(QueryResult& p_query, const IVectorFilter* p_filter, SearchStats* p_stats) const
+        {
+            return SearchDiskIndexInternal(p_query, p_filter, nullptr, 0, p_stats);
+        }
+
+        template <typename T>
+        ErrorCode Index<T>::SearchDiskIndex(QueryResult& p_query, const std::uint64_t* p_filterBits, std::size_t p_filterWordCount, SearchStats* p_stats) const
+        {
+            return SearchDiskIndexInternal(p_query, nullptr, p_filterBits, p_filterWordCount, p_stats);
+        }
+
+        template <typename T>
+        ErrorCode Index<T>::SearchDiskIndexInternal(QueryResult& p_query, const IVectorFilter* p_filter, const std::uint64_t* p_filterBits, std::size_t p_filterWordCount, SearchStats* p_stats) const
+        {
             if (nullptr == m_extraSearcher) return ErrorCode::EmptyIndex;
 
             COMMON::QueryResultSet<T>* p_queryResults = (COMMON::QueryResultSet<T>*) & p_query;
@@ -388,6 +441,7 @@ namespace SPTAG
             }
             m_workspace->m_deduper.clear();
             m_workspace->m_postingIDs.clear();
+            VectorFilterScope vectorFilterScope(m_workspace.get(), p_filter, p_filterBits, p_filterWordCount);
 
             float limitDist = p_queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
             int i = 0;
@@ -399,7 +453,13 @@ namespace SPTAG
                 {
                     m_workspace->m_postingIDs.emplace_back(res->VID);
                 }
-                if (m_vectorTranslateMap.get() != nullptr) res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
+                if (m_vectorTranslateMap.get() != nullptr) {
+                    res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
+                    if (!m_workspace->CheckVectorFilter(res->VID)) {
+                        res->VID = -1;
+                        res->Dist = MaxDist;
+                    }
+                }
                 else {
                     res->VID = -1;
                     res->Dist = MaxDist;
@@ -410,7 +470,13 @@ namespace SPTAG
             {
                 auto res = p_queryResults->GetResult(i);
                 if (res->VID == -1) break;
-                if (m_vectorTranslateMap.get() != nullptr)  res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
+                if (m_vectorTranslateMap.get() != nullptr) {
+                    res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
+                    if (!m_workspace->CheckVectorFilter(res->VID)) {
+                        res->VID = -1;
+                        res->Dist = MaxDist;
+                    }
+                }
                 else {
                     res->VID = -1;
                     res->Dist = MaxDist;
@@ -1134,5 +1200,3 @@ template class SPTAG::SPANN::Index<Type>; \
 
 #include "inc/Core/DefinitionList.h"
 #undef DefineVectorValueType
-
-

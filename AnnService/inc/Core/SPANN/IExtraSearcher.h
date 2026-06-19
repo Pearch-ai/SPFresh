@@ -7,17 +7,54 @@
 #include "Options.h"
 
 #include "inc/Core/VectorIndex.h"
+#include "inc/Core/Common/WorkSpace.h"
 #include "inc/Core/Common/VersionLabel.h"
 #include "inc/Helper/AsyncFileReader.h"
+#include "inc/Helper/VectorSetReader.h"
 
 #include <memory>
 #include <vector>
 #include <chrono>
 #include <atomic>
 #include <set>
+#include <cstddef>
+#include <cstdint>
 
 namespace SPTAG {
     namespace SPANN {
+
+        class IVectorFilter
+        {
+        public:
+            virtual ~IVectorFilter() {}
+
+            virtual bool Contains(SizeType p_vectorID) const = 0;
+        };
+
+        class BitmapVectorFilter : public IVectorFilter
+        {
+        public:
+            BitmapVectorFilter(const std::uint64_t* p_bits, std::size_t p_wordCount)
+                : m_bits(p_bits),
+                  m_wordCount(p_wordCount)
+            {
+            }
+
+            bool Contains(SizeType p_vectorID) const override
+            {
+                if (m_bits == nullptr || p_vectorID < 0) return false;
+
+                const auto vectorID = static_cast<std::uint64_t>(p_vectorID);
+                const auto word = vectorID >> 6;
+                if (word >= m_wordCount) return false;
+
+                return (m_bits[word] & (std::uint64_t(1) << (vectorID & 63))) != 0;
+            }
+
+        private:
+            const std::uint64_t* m_bits;
+            std::size_t m_wordCount;
+        };
 
         struct SearchStats
         {
@@ -229,6 +266,43 @@ namespace SPTAG {
 
             static void Reset() { g_spaceCount = 0; }
 
+            void SetVectorFilter(const IVectorFilter* p_filter)
+            {
+                m_vectorFilter = p_filter;
+                m_vectorFilterBits = nullptr;
+                m_vectorFilterWordCount = 0;
+            }
+
+            void SetVectorFilterBitmap(const std::uint64_t* p_bits, std::size_t p_wordCount)
+            {
+                m_vectorFilter = nullptr;
+                m_vectorFilterBits = p_bits;
+                m_vectorFilterWordCount = p_wordCount;
+            }
+
+            void ClearVectorFilter()
+            {
+                m_vectorFilter = nullptr;
+                m_vectorFilterBits = nullptr;
+                m_vectorFilterWordCount = 0;
+            }
+
+            inline bool CheckVectorFilter(SizeType p_vectorID) const
+            {
+                if (m_vectorFilterBits != nullptr)
+                {
+                    if (p_vectorID < 0) return false;
+
+                    const auto vectorID = static_cast<std::uint64_t>(p_vectorID);
+                    const auto word = vectorID >> 6;
+                    if (word >= m_vectorFilterWordCount) return false;
+
+                    return (m_vectorFilterBits[word] & (std::uint64_t(1) << (vectorID & 63))) != 0;
+                }
+
+                return m_vectorFilter == nullptr || m_vectorFilter->Contains(p_vectorID);
+            }
+
             std::vector<int> m_postingIDs;
 
             COMMON::OptHashPosVector m_deduper;
@@ -245,6 +319,42 @@ namespace SPTAG {
             int m_spaceID;
 
             static std::atomic_int g_spaceCount;
+
+        private:
+            const IVectorFilter* m_vectorFilter = nullptr;
+            const std::uint64_t* m_vectorFilterBits = nullptr;
+            std::size_t m_vectorFilterWordCount = 0;
+        };
+
+        class VectorFilterScope
+        {
+        public:
+            VectorFilterScope(ExtraWorkSpace* p_workspace,
+                const IVectorFilter* p_filter,
+                const std::uint64_t* p_filterBits,
+                std::size_t p_filterWordCount)
+                : m_workspace(p_workspace)
+            {
+                if (m_workspace == nullptr) return;
+
+                if (p_filterBits != nullptr) {
+                    m_workspace->SetVectorFilterBitmap(p_filterBits, p_filterWordCount);
+                }
+                else {
+                    m_workspace->SetVectorFilter(p_filter);
+                }
+            }
+
+            ~VectorFilterScope()
+            {
+                if (m_workspace != nullptr) m_workspace->ClearVectorFilter();
+            }
+
+            VectorFilterScope(const VectorFilterScope&) = delete;
+            VectorFilterScope& operator=(const VectorFilterScope&) = delete;
+
+        private:
+            ExtraWorkSpace* m_workspace;
         };
 
         class IExtraSearcher

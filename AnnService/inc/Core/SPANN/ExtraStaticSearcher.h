@@ -106,6 +106,7 @@ namespace SPTAG
             uint64_t offsetVectorID, offsetVector;\
             (this->*m_parsePosting)(offsetVectorID, offsetVector, i, listInfo->listEleCount);\
             int vectorID = *(reinterpret_cast<int*>(p_postingListFullData + offsetVectorID));\
+            if (!p_exWorkSpace->CheckVectorFilter(vectorID)) continue; \
             if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) continue; \
             (this->*m_parseEncoding)(p_index, listInfo, (ValueType*)(p_postingListFullData + offsetVector));\
             auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), p_postingListFullData + offsetVector); \

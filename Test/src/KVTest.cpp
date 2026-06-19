@@ -3,10 +3,13 @@
 
 #include "inc/Test.h"
 #include "inc/Core/SPANN/ExtraRocksDBController.h"
+#ifdef SPDK
 #include "inc/Core/SPANN/ExtraSPDKController.h"
+#endif
 
 #include <memory>
 #include <chrono>
+#include <stdexcept>
 
 // enable rocksdb io_uring
 extern "C" bool RocksDbIOUringEnable() { return true; }
@@ -46,7 +49,11 @@ void Test(std::string path, std::string type, bool debug = false)
     if (type == "RocksDB") {
         db.reset(new RocksDBIO(path.c_str(), true));
     } else if (type == "SPDK") {
+#ifdef SPDK
         db.reset(new SPDKIO(path.c_str(), 1024 * 1024, MaxSize, 64));
+#else
+        throw std::runtime_error("SPDK support is not compiled in.");
+#endif
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -89,9 +96,11 @@ BOOST_AUTO_TEST_CASE(RocksDBTest)
     Test("tmp_rocksdb", "RocksDB", true);
 }
 
+#ifdef SPDK
 BOOST_AUTO_TEST_CASE(SPDKTest)
 {
     Test("tmp_spdk", "SPDK", true);
 }
+#endif
 
 BOOST_AUTO_TEST_SUITE_END()

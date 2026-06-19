@@ -125,7 +125,11 @@ namespace SPTAG
             ErrorCode BuildIndex(const void* p_data, SizeType p_vectorNum, DimensionType p_dimension, bool p_normalized = false, bool p_shareOwnership = false);
             ErrorCode BuildIndex(bool p_normalized = false);
             ErrorCode SearchIndex(QueryResult &p_query, bool p_searchDeleted = false) const;
+            ErrorCode SearchIndex(QueryResult& p_query, const IVectorFilter* p_filter, bool p_searchDeleted = false) const;
+            ErrorCode SearchIndex(QueryResult& p_query, const std::uint64_t* p_filterBits, std::size_t p_filterWordCount, bool p_searchDeleted = false) const;
             ErrorCode SearchDiskIndex(QueryResult& p_query, SearchStats* p_stats = nullptr) const;
+            ErrorCode SearchDiskIndex(QueryResult& p_query, const IVectorFilter* p_filter, SearchStats* p_stats = nullptr) const;
+            ErrorCode SearchDiskIndex(QueryResult& p_query, const std::uint64_t* p_filterBits, std::size_t p_filterWordCount, SearchStats* p_stats = nullptr) const;
             ErrorCode DebugSearchDiskIndex(QueryResult& p_query, int p_subInternalResultNum, int p_internalResultNum,
                 SearchStats* p_stats = nullptr, std::set<int>* truth = nullptr, std::map<int, std::set<int>>* found = nullptr) const;
             ErrorCode UpdateIndex();
@@ -155,6 +159,8 @@ namespace SPTAG
             bool SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader>& p_reader);
 
             ErrorCode BuildIndexInternal(std::shared_ptr<Helper::VectorSetReader>& p_reader);
+            ErrorCode SearchIndexInternal(QueryResult& p_query, const IVectorFilter* p_filter, const std::uint64_t* p_filterBits, std::size_t p_filterWordCount, bool p_searchDeleted) const;
+            ErrorCode SearchDiskIndexInternal(QueryResult& p_query, const IVectorFilter* p_filter, const std::uint64_t* p_filterBits, std::size_t p_filterWordCount, SearchStats* p_stats) const;
 
         public:
             bool AllFinished() { if (m_options.m_useKV || m_options.m_useSPDK) return m_extraSearcher->AllFinished(); return true; }

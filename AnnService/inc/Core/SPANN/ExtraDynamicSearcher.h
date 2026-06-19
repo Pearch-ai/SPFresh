@@ -13,7 +13,9 @@
 #include "inc/Core/Common/FineGrainedLock.h"
 #include "PersistentBuffer.h"
 #include "inc/Core/Common/PostingSizeRecord.h"
+#ifdef SPDK
 #include "ExtraSPDKController.h"
+#endif
 #include <chrono>
 #include <map>
 #include <cmath>
@@ -22,6 +24,7 @@
 #include <numeric>
 #include <utility>
 #include <random>
+#include <stdexcept>
 #include <tbb/concurrent_hash_map.h>
 
 #ifdef ROCKSDB
@@ -162,8 +165,12 @@ namespace SPTAG::SPANN {
     public:
         ExtraDynamicSearcher(const char* dbPath, int dim, int postingBlockLimit, bool useDirectIO, float searchLatencyHardLimit, int mergeThreshold, bool useSPDK = false, int batchSize = 64, int bufferLength = 3) {
             if (useSPDK) {
+#ifdef SPDK
                 db.reset(new SPDKIO(dbPath, 1024 * 1024, MaxSize, postingBlockLimit + bufferLength, 1024, batchSize));
                 m_postingSizeLimit = postingBlockLimit * PageSize / (sizeof(ValueType) * dim + sizeof(int) + sizeof(uint8_t));
+#else
+                throw std::runtime_error("SPDK support is not compiled in. Reconfigure with -DSPDK=ON and a built SPDK tree.");
+#endif
             } else {
 #ifdef ROCKSDB
                 db.reset(new RocksDBIO(dbPath, useDirectIO));
@@ -1165,6 +1172,10 @@ namespace SPTAG::SPANN {
                     int vectorID = *(reinterpret_cast<int*>(vectorInfo));
                     if (m_versionMap->Deleted(vectorID)) {
                         realNum--;
+                        listElements--;
+                        continue;
+                    }
+                    if (!p_exWorkSpace->CheckVectorFilter(vectorID)) {
                         listElements--;
                         continue;
                     }
