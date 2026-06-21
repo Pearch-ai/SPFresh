@@ -1241,11 +1241,12 @@ namespace SPTAG::SPANN {
 
             SizeType fullCount = 0;
             {
-                auto fullVectors = p_reader->GetVectorSet();
-                fullCount = fullVectors->Count();
-                m_vectorInfoSize = fullVectors->PerVectorDataSize() + m_metaDataSize;
+                auto probeVectors = upperBound > 0
+                    ? p_reader->GetVectorSet(0, std::min<SizeType>(upperBound, 1))
+                    : p_reader->GetVectorSet();
+                fullCount = upperBound > 0 ? upperBound : probeVectors->Count();
+                m_vectorInfoSize = probeVectors->PerVectorDataSize() + m_metaDataSize;
             }
-            if (upperBound > 0) fullCount = upperBound;
 
             // m_metaDataSize = sizeof(int) + sizeof(uint8_t) + sizeof(float);
             m_metaDataSize = sizeof(int) + sizeof(uint8_t);

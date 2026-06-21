@@ -43,13 +43,23 @@ bool set_parameter(
 bool configure_spann(
     const std::shared_ptr<SPTAG::VectorIndex>& index,
     const std::string& index_dir,
+    uint32_t dimension,
     uint32_t build_threads,
-    bool rebuild_ssd_only)
+    bool rebuild_ssd_only,
+    const char* vector_paths,
+    uint32_t vector_count)
 {
     const std::string build_threads_value = std::to_string(build_threads);
+    const std::string dimension_value = std::to_string(dimension);
+    const std::string vector_count_value = std::to_string(vector_count);
     const char* build_head = rebuild_ssd_only ? "false" : "true";
     return set_parameter(index, "IndexAlgoType", "BKT", "Base")
+        && set_parameter(index, "ValueType", "Float", "Base")
         && set_parameter(index, "DistCalcMethod", "L2", "Base")
+        && set_parameter(index, "Dim", dimension_value.c_str(), "Base")
+        && set_parameter(index, "VectorPath", vector_paths == nullptr ? "" : vector_paths, "Base")
+        && set_parameter(index, "VectorType", "DEFAULT", "Base")
+        && set_parameter(index, "VectorSize", vector_count_value.c_str(), "Base")
         && set_parameter(index, "IndexDirectory", index_dir.c_str(), "Base")
         && set_parameter(index, "isExecute", build_head, "SelectHead")
         && set_parameter(index, "NumberOfThreads", build_threads_value.c_str(), "SelectHead")
@@ -121,7 +131,7 @@ tpsql_spfresh_status build_spann(
         if (index == nullptr) {
             return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to create SPFresh index");
         }
-        if (!configure_spann(index, handle->index_dir, handle->build_threads, rebuild_ssd_only)) {
+        if (!configure_spann(index, handle->index_dir, handle->dimension, handle->build_threads, rebuild_ssd_only, nullptr, vector_count)) {
             return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to configure SPFresh index");
         }
 
@@ -151,6 +161,75 @@ tpsql_spfresh_status build_spann(
         return set_error(handle, TPSQL_SPFRESH_EXCEPTION, error.what());
     } catch (...) {
         return set_error(handle, TPSQL_SPFRESH_EXCEPTION, "unknown SPFresh build exception");
+    }
+}
+
+tpsql_spfresh_status build_spann_from_files(
+    tpsql_spfresh_index* handle,
+    const char* vector_paths,
+    uint32_t vector_count,
+    bool rebuild_ssd_only)
+{
+    if (handle == nullptr || vector_paths == nullptr || vector_paths[0] == '\0'
+        || vector_count == 0 || handle->dimension == 0) {
+        return set_error(handle, TPSQL_SPFRESH_INVALID_ARGUMENT, "invalid SPFresh file build arguments");
+    }
+
+    try {
+        std::filesystem::create_directories(handle->index_dir);
+        if (rebuild_ssd_only) {
+            const auto head_loader =
+                std::filesystem::path(handle->index_dir) / "HeadIndex" / "indexloader.ini";
+            if (!std::filesystem::exists(head_loader)) {
+                return set_error(
+                    handle,
+                    TPSQL_SPFRESH_BUILD_FAILED,
+                    "cannot continue SPFresh rebuild: missing HeadIndex/indexloader.ini");
+            }
+
+            const auto ssd_file =
+                std::filesystem::path(handle->index_dir) / "SPTAGFullList.bin";
+            std::error_code remove_error;
+            std::filesystem::remove(ssd_file, remove_error);
+            if (remove_error) {
+                return set_error(
+                    handle,
+                    TPSQL_SPFRESH_BUILD_FAILED,
+                    "cannot remove incomplete SPFresh SSD index file: " + remove_error.message());
+            }
+        }
+
+        auto index = SPTAG::VectorIndex::CreateInstance(
+            SPTAG::IndexAlgoType::SPANN,
+            SPTAG::VectorValueType::Float);
+        if (index == nullptr) {
+            return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to create SPFresh index");
+        }
+        if (!configure_spann(index, handle->index_dir, handle->dimension, handle->build_threads, rebuild_ssd_only, vector_paths, vector_count)) {
+            return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to configure SPFresh index");
+        }
+
+        SPTAG::ErrorCode status = index->BuildIndex(false);
+        if (status != SPTAG::ErrorCode::Success) {
+            return set_error(
+                handle,
+                TPSQL_SPFRESH_BUILD_FAILED,
+                "SPFresh file BuildIndex failed with error code " + std::to_string(static_cast<int>(status)));
+        }
+        if (!write_loader_config(index, handle->index_dir)) {
+            return set_error(
+                handle,
+                TPSQL_SPFRESH_BUILD_FAILED,
+                "failed to write SPFresh indexloader.ini");
+        }
+
+        handle->index = std::move(index);
+        handle->last_error.clear();
+        return TPSQL_SPFRESH_OK;
+    } catch (const std::exception& error) {
+        return set_error(handle, TPSQL_SPFRESH_EXCEPTION, error.what());
+    } catch (...) {
+        return set_error(handle, TPSQL_SPFRESH_EXCEPTION, "unknown SPFresh file build exception");
     }
 }
 
@@ -198,6 +277,22 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_rebuild_ssd(
     uint32_t vector_count)
 {
     return build_spann(handle, vectors, vector_count, true);
+}
+
+extern "C" tpsql_spfresh_status tpsql_spfresh_build_from_files(
+    tpsql_spfresh_index* handle,
+    const char* vector_paths,
+    uint32_t vector_count)
+{
+    return build_spann_from_files(handle, vector_paths, vector_count, false);
+}
+
+extern "C" tpsql_spfresh_status tpsql_spfresh_rebuild_ssd_from_files(
+    tpsql_spfresh_index* handle,
+    const char* vector_paths,
+    uint32_t vector_count)
+{
+    return build_spann_from_files(handle, vector_paths, vector_count, true);
 }
 
 extern "C" tpsql_spfresh_status tpsql_spfresh_load_existing(tpsql_spfresh_index* handle)

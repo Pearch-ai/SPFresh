@@ -435,11 +435,12 @@ namespace SPTAG
                 SizeType fullCount = 0;
                 size_t vectorInfoSize = 0;
                 {
-                    auto fullVectors = p_reader->GetVectorSet();
-                    fullCount = fullVectors->Count();
-                    vectorInfoSize = fullVectors->PerVectorDataSize() + sizeof(int);
+                    auto probeVectors = upperBound > 0
+                        ? p_reader->GetVectorSet(0, std::min<SizeType>(upperBound, 1))
+                        : p_reader->GetVectorSet();
+                    fullCount = upperBound > 0 ? upperBound : probeVectors->Count();
+                    vectorInfoSize = probeVectors->PerVectorDataSize() + sizeof(int);
                 }
-                if (upperBound > 0) fullCount = upperBound;
 
                 Selection selections(static_cast<size_t>(fullCount) * p_opt.m_replicaCount, p_opt.m_tmpdir);
                 LOG(Helper::LogLevel::LL_Info, "Full vector count:%d Edge bytes:%llu selection size:%zu, capacity size:%zu\n", fullCount, sizeof(Edge), selections.m_selections.size(), selections.m_selections.capacity());

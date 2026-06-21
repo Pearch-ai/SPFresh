@@ -38,6 +38,16 @@ tpsql_spfresh_status tpsql_spfresh_rebuild_ssd(
     const float* vectors,
     uint32_t vector_count);
 
+tpsql_spfresh_status tpsql_spfresh_build_from_files(
+    tpsql_spfresh_index* index,
+    const char* vector_paths,
+    uint32_t vector_count);
+
+tpsql_spfresh_status tpsql_spfresh_rebuild_ssd_from_files(
+    tpsql_spfresh_index* index,
+    const char* vector_paths,
+    uint32_t vector_count);
+
 tpsql_spfresh_status tpsql_spfresh_load_existing(tpsql_spfresh_index* index);
 
 tpsql_spfresh_status tpsql_spfresh_search(

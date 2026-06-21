@@ -947,7 +947,7 @@ namespace SPTAG
                         }
                     }
 
-                    if (!m_extraSearcher->BuildIndex(p_reader, m_index, m_options, m_versionMap)) {
+                    if (!m_extraSearcher->BuildIndex(p_reader, m_index, m_options, m_versionMap, m_options.m_vectorSize)) {
                         LOG(Helper::LogLevel::LL_Error, "BuildSSDIndex Failed!\n");
                         if (m_options.m_buildSsdIndex) {
                             return ErrorCode::Fail;
@@ -1010,7 +1010,9 @@ namespace SPTAG
                     LOG(Helper::LogLevel::LL_Error, "Failed to read vector file.\n");
                     return ErrorCode::Fail;
                 }
-                m_options.m_vectorSize = vectorReader->GetVectorSet()->Count();
+                if (m_options.m_vectorSize < 0) {
+                    m_options.m_vectorSize = vectorReader->GetVectorSet()->Count();
+                }
             }
 
             return BuildIndexInternal(vectorReader);

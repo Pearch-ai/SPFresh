@@ -6,6 +6,8 @@
 
 #include "inc/Helper/VectorSetReader.h"
 
+#include <vector>
+
 namespace SPTAG
 {
 namespace Helper
@@ -26,6 +28,8 @@ public:
 
 private:
     std::string m_vectorOutput;
+
+    std::vector<std::string> m_vectorOutputs;
 
     std::string m_metadataConentOutput;
 
