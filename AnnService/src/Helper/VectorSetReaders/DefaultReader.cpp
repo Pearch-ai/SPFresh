@@ -46,6 +46,11 @@ DefaultVectorReader::LoadFile(const std::string& p_filePaths)
 std::shared_ptr<VectorSet>
 DefaultVectorReader::GetVectorSet(SizeType start, SizeType end) const
 {
+    if (m_options->m_loadAllVectors && m_cachedVectorSet != nullptr && start == 0 &&
+        (end < 0 || end == m_cachedVectorSet->Count())) {
+        return m_cachedVectorSet;
+    }
+
     std::vector<std::string> vectorFiles =
         m_vectorOutputs.empty() ? std::vector<std::string>{m_vectorOutput} : m_vectorOutputs;
 
@@ -88,6 +93,7 @@ DefaultVectorReader::GetVectorSet(SizeType start, SizeType end) const
     }
     if (start > totalRows) start = totalRows;
     if (end < 0 || end > totalRows) end = totalRows;
+    const bool cacheFullRange = m_options->m_loadAllVectors && start == 0 && end == totalRows;
     std::uint64_t totalRecordVectorBytes = ((std::uint64_t)GetValueTypeSize(m_options->m_inputValueType)) * (end - start) * col;
     ByteArray vectorSet;
     if (totalRecordVectorBytes > 0) {
@@ -122,10 +128,14 @@ DefaultVectorReader::GetVectorSet(SizeType start, SizeType end) const
     }
 
     LOG(Helper::LogLevel::LL_Info, "Load Vector(%d,%d)\n", end - start, col);
-    return std::make_shared<BasicVectorSet>(vectorSet,
-                                            m_options->m_inputValueType,
-                                            col,
-                                            end - start);
+    auto result = std::make_shared<BasicVectorSet>(vectorSet,
+                                                  m_options->m_inputValueType,
+                                                  col,
+                                                  end - start);
+    if (cacheFullRange) {
+        m_cachedVectorSet = result;
+    }
+    return result;
 }
 
 

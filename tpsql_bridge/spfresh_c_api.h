@@ -25,7 +25,10 @@ typedef enum tpsql_spfresh_status {
 tpsql_spfresh_index* tpsql_spfresh_create(
     uint32_t dimension,
     const char* index_dir,
-    uint32_t build_threads);
+    uint32_t build_threads,
+    uint32_t ssd_batches,
+    uint32_t head_vector_count,
+    int load_all_vectors);
 void tpsql_spfresh_destroy(tpsql_spfresh_index* index);
 
 tpsql_spfresh_status tpsql_spfresh_build(

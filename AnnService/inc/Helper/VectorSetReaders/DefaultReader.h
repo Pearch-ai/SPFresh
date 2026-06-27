@@ -31,6 +31,8 @@ private:
 
     std::vector<std::string> m_vectorOutputs;
 
+    mutable std::shared_ptr<VectorSet> m_cachedVectorSet;
+
     std::string m_metadataConentOutput;
 
     std::string m_metadataIndexOutput;

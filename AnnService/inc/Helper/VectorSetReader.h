@@ -19,7 +19,7 @@ namespace Helper
 class ReaderOptions : public ArgumentsParser
 {
 public:
-    ReaderOptions(VectorValueType p_valueType, DimensionType p_dimension, VectorFileType p_fileType, std::string p_vectorDelimiter = "|", std::uint32_t p_threadNum = 32, bool p_normalized = false);
+    ReaderOptions(VectorValueType p_valueType, DimensionType p_dimension, VectorFileType p_fileType, std::string p_vectorDelimiter = "|", std::uint32_t p_threadNum = 32, bool p_normalized = false, bool p_loadAllVectors = false);
 
     ~ReaderOptions();
 
@@ -34,6 +34,8 @@ public:
     std::uint32_t m_threadNum;
 
     bool m_normalized;
+
+    bool m_loadAllVectors;
 };
 
 class VectorSetReader

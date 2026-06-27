@@ -13,6 +13,9 @@
 struct tpsql_spfresh_index {
     uint32_t dimension;
     uint32_t build_threads;
+    uint32_t ssd_batches;
+    uint32_t head_vector_count;
+    bool load_all_vectors;
     std::string index_dir;
     std::shared_ptr<SPTAG::VectorIndex> index;
     std::string last_error;
@@ -47,12 +50,23 @@ bool configure_spann(
     uint32_t build_threads,
     bool rebuild_ssd_only,
     const char* vector_paths,
-    uint32_t vector_count)
+    uint32_t vector_count,
+    uint32_t ssd_batches,
+    uint32_t head_vector_count,
+    bool load_all_vectors)
 {
     const std::string build_threads_value = std::to_string(build_threads);
     const std::string dimension_value = std::to_string(dimension);
     const std::string vector_count_value = std::to_string(vector_count);
+    const std::string ssd_batches_value = std::to_string(ssd_batches);
+    const std::string head_vector_count_value =
+        std::to_string(std::min(head_vector_count, vector_count));
     const char* build_head = rebuild_ssd_only ? "false" : "true";
+    const char* load_all_vectors_value = load_all_vectors ? "true" : "false";
+    const bool has_head_vector_target = head_vector_count > 0;
+    const char* select_threshold_value = has_head_vector_target ? "0" : "6";
+    const char* split_factor_value = has_head_vector_target ? "0" : "5";
+    const char* split_threshold_value = has_head_vector_target ? "0" : "25";
     return set_parameter(index, "IndexAlgoType", "BKT", "Base")
         && set_parameter(index, "ValueType", "Float", "Base")
         && set_parameter(index, "DistCalcMethod", "L2", "Base")
@@ -64,6 +78,10 @@ bool configure_spann(
         && set_parameter(index, "isExecute", build_head, "SelectHead")
         && set_parameter(index, "NumberOfThreads", build_threads_value.c_str(), "SelectHead")
         && set_parameter(index, "Ratio", "0.2", "SelectHead")
+        && set_parameter(index, "Count", head_vector_count_value.c_str(), "SelectHead")
+        && set_parameter(index, "SelectThreshold", select_threshold_value, "SelectHead")
+        && set_parameter(index, "SplitFactor", split_factor_value, "SelectHead")
+        && set_parameter(index, "SplitThreshold", split_threshold_value, "SelectHead")
         && set_parameter(index, "isExecute", build_head, "BuildHead")
         && set_parameter(index, "RefineIterations", "3", "BuildHead")
         && set_parameter(index, "NumberOfThreads", build_threads_value.c_str(), "BuildHead")
@@ -73,7 +91,9 @@ bool configure_spann(
         && set_parameter(index, "PostingPageLimit", "12", "BuildSSDIndex")
         && set_parameter(index, "SearchPostingPageLimit", "12", "BuildSSDIndex")
         && set_parameter(index, "InternalResultNum", "64", "BuildSSDIndex")
-        && set_parameter(index, "SearchInternalResultNum", "64", "BuildSSDIndex");
+        && set_parameter(index, "SearchInternalResultNum", "64", "BuildSSDIndex")
+        && set_parameter(index, "Batches", ssd_batches_value.c_str(), "BuildSSDIndex")
+        && set_parameter(index, "LoadAllVectors", load_all_vectors_value, "BuildSSDIndex");
 }
 
 bool write_loader_config(
@@ -131,7 +151,17 @@ tpsql_spfresh_status build_spann(
         if (index == nullptr) {
             return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to create SPFresh index");
         }
-        if (!configure_spann(index, handle->index_dir, handle->dimension, handle->build_threads, rebuild_ssd_only, nullptr, vector_count)) {
+        if (!configure_spann(
+                index,
+                handle->index_dir,
+                handle->dimension,
+                handle->build_threads,
+                rebuild_ssd_only,
+                nullptr,
+                vector_count,
+                handle->ssd_batches,
+                handle->head_vector_count,
+                handle->load_all_vectors)) {
             return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to configure SPFresh index");
         }
 
@@ -205,7 +235,17 @@ tpsql_spfresh_status build_spann_from_files(
         if (index == nullptr) {
             return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to create SPFresh index");
         }
-        if (!configure_spann(index, handle->index_dir, handle->dimension, handle->build_threads, rebuild_ssd_only, vector_paths, vector_count)) {
+        if (!configure_spann(
+                index,
+                handle->index_dir,
+                handle->dimension,
+                handle->build_threads,
+                rebuild_ssd_only,
+                vector_paths,
+                vector_count,
+                handle->ssd_batches,
+                handle->head_vector_count,
+                handle->load_all_vectors)) {
             return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to configure SPFresh index");
         }
 
@@ -238,9 +278,16 @@ tpsql_spfresh_status build_spann_from_files(
 extern "C" tpsql_spfresh_index* tpsql_spfresh_create(
     uint32_t dimension,
     const char* index_dir,
-    uint32_t build_threads)
+    uint32_t build_threads,
+    uint32_t ssd_batches,
+    uint32_t head_vector_count,
+    int load_all_vectors)
 {
-    if (dimension == 0 || index_dir == nullptr || index_dir[0] == '\0' || build_threads == 0) {
+    if (dimension == 0
+        || index_dir == nullptr
+        || index_dir[0] == '\0'
+        || build_threads == 0
+        || ssd_batches == 0) {
         return nullptr;
     }
 
@@ -248,6 +295,9 @@ extern "C" tpsql_spfresh_index* tpsql_spfresh_create(
         auto* handle = new tpsql_spfresh_index();
         handle->dimension = dimension;
         handle->build_threads = build_threads;
+        handle->ssd_batches = ssd_batches;
+        handle->head_vector_count = head_vector_count;
+        handle->load_all_vectors = load_all_vectors != 0;
         handle->index_dir = index_dir;
         return handle;
     } catch (...) {
