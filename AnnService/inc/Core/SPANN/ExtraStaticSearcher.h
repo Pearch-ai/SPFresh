@@ -8,13 +8,21 @@
 #include "inc/Helper/AsyncFileReader.h"
 #include "IExtraSearcher.h"
 #include "inc/Core/Common/TruthSet.h"
+#include "inc/Core/Common/TpsqlMemoryLog.h"
 #include "Compressor.h"
 
 #include <map>
+#include <algorithm>
 #include <cmath>
 #include <climits>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <numeric>
+#include <string>
 
 namespace SPTAG
 {
@@ -113,9 +121,45 @@ namespace SPTAG
             queryResults.AddPoint(vectorID, distance2leaf); \
         } \
 
+#define ProcessPostingPartial(loadedPageMask) \
+        for (int i = 0; i < listInfo->listEleCount; i++) { \
+            const std::uint64_t recordStart = static_cast<std::uint64_t>(listInfo->pageOffset) + static_cast<std::uint64_t>(i) * static_cast<std::uint64_t>(m_vectorInfoSize);\
+            const std::uint64_t recordEnd = recordStart + static_cast<std::uint64_t>(m_vectorInfoSize) - 1;\
+            const std::uint64_t recordPageMask = this->PageMaskForByteRange(recordStart, recordEnd);\
+            if ((recordPageMask & loadedPageMask) != recordPageMask) continue;\
+            uint64_t offsetVectorID, offsetVector;\
+            (this->*m_parsePosting)(offsetVectorID, offsetVector, i, listInfo->listEleCount);\
+            int vectorID = *(reinterpret_cast<int*>(p_postingListFullData + offsetVectorID));\
+            if (!p_exWorkSpace->CheckVectorFilter(vectorID)) continue; \
+            if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) continue; \
+            (this->*m_parseEncoding)(p_index, listInfo, (ValueType*)(p_postingListFullData + offsetVector));\
+            auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), p_postingListFullData + offsetVector); \
+            queryResults.AddPoint(vectorID, distance2leaf); \
+        } \
+
         template <typename ValueType>
         class ExtraStaticSearcher : public IExtraSearcher
         {
+        private:
+            struct PageReadRange
+            {
+                std::uint16_t firstPage = 0;
+                std::uint16_t pageCount = 0;
+            };
+
+            struct ListInfo
+            {
+                std::size_t listTotalBytes = 0;
+
+                int listEleCount = 0;
+
+                std::uint16_t listPageCount = 0;
+
+                std::uint64_t listOffset = 0;
+
+                std::uint16_t pageOffset = 0;
+            };
+
         public:
             ExtraStaticSearcher()
             {
@@ -205,6 +249,9 @@ namespace SPTAG
 #if defined(ASYNC_READ) && !defined(BATCH_READ)
                 int unprocessed = 0;
 #endif
+#ifdef BATCH_READ
+                uint32_t queuedReadCount = 0;
+#endif
 
                 for (uint32_t pi = 0; pi < postingListCount; ++pi)
                 {
@@ -216,15 +263,47 @@ namespace SPTAG
                     Helper::DiskIO* indexFile = m_indexFiles[fileid].get();
 #endif
 
-                    diskRead += listInfo->listPageCount;
-                    diskIO += 1;
                     listElements += listInfo->listEleCount;
 
                     size_t totalBytes = (static_cast<size_t>(listInfo->listPageCount) << PageSizeEx);
                     char* buffer = (char*)((p_exWorkSpace->m_pageBuffers[pi]).GetBuffer());
 
+                    std::vector<PageReadRange> partialRanges;
+                    std::uint64_t loadedPageMask = 0;
+                    if (truth == nullptr
+                        && BuildPartialReadRanges(curPostingID, p_exWorkSpace, partialRanges, loadedPageMask))
+                    {
+                        Helper::DiskIO* partialIndexFile = m_indexFiles[fileid].get();
+                        for (const auto& range : partialRanges)
+                        {
+                            const std::uint64_t rangeOffset =
+                                listInfo->listOffset + (static_cast<std::uint64_t>(range.firstPage) << PageSizeEx);
+                            const std::uint64_t rangeBytes =
+                                static_cast<std::uint64_t>(range.pageCount) << PageSizeEx;
+                            char* rangeBuffer =
+                                buffer + (static_cast<std::uint64_t>(range.firstPage) << PageSizeEx);
+                            auto numRead = partialIndexFile->ReadBinary(rangeBytes, rangeBuffer, rangeOffset);
+                            if (numRead != rangeBytes) {
+                                LOG(Helper::LogLevel::LL_Error, "File %s partial read bytes, expected: %zu, actual: %llu.\n", m_extraFullGraphFile.c_str(), static_cast<size_t>(rangeBytes), numRead);
+                                throw std::runtime_error("File partial read mismatch");
+                            }
+                        }
+                        diskRead += CountBits(loadedPageMask);
+                        diskIO += static_cast<int>(partialRanges.size());
+                        char* p_postingListFullData = buffer + listInfo->pageOffset;
+                        ProcessPostingPartial(loadedPageMask);
+                        continue;
+                    }
+
+                    diskRead += listInfo->listPageCount;
+                    diskIO += 1;
+
 #ifdef ASYNC_READ       
+#ifdef BATCH_READ
+                    auto& request = p_exWorkSpace->m_diskRequests[queuedReadCount++];
+#else
                     auto& request = p_exWorkSpace->m_diskRequests[pi];
+#endif
                     request.m_offset = listInfo->listOffset;
                     request.m_readSize = totalBytes;
                     request.m_buffer = buffer;
@@ -279,7 +358,9 @@ namespace SPTAG
 
 #ifdef ASYNC_READ
 #ifdef BATCH_READ
-                BatchReadFileAsync(m_indexFiles, (p_exWorkSpace->m_diskRequests).data(), postingListCount);
+                if (queuedReadCount > 0) {
+                    BatchReadFileAsync(m_indexFiles, (p_exWorkSpace->m_diskRequests).data(), queuedReadCount);
+                }
 #else
                 while (unprocessed > 0)
                 {
@@ -747,25 +828,450 @@ namespace SPTAG
 
             virtual bool CheckValidPosting(SizeType postingID)
             {
-                return m_listInfos[postingID].listEleCount != 0;
+                return postingID >= 0
+                    && static_cast<size_t>(postingID) < m_listInfos.size()
+                    && m_listInfos[postingID].listEleCount != 0;
+            }
+
+            bool CheckPostingFilter(SizeType postingID, const ExtraWorkSpace* p_exWorkSpace) const override
+            {
+                if (!m_postingMaskSidecarLoaded
+                    || p_exWorkSpace == nullptr
+                    || !p_exWorkSpace->HasVectorFilter()
+                    || postingID < 0
+                    || static_cast<size_t>(postingID + 1) >= m_postingMaskOffsets.size())
+                {
+                    return true;
+                }
+
+                const auto begin = m_postingMaskOffsets[postingID];
+                const auto end = m_postingMaskOffsets[postingID + 1];
+                for (std::uint64_t idx = begin; idx < end; ++idx)
+                {
+                    if (p_exWorkSpace->CheckVectorFilter(static_cast<SizeType>(m_postingMaskVectorIDs[idx]))) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            bool BuildPostingMaskSidecar(const std::string& p_indexDirectory) override
+            {
+                (void)p_indexDirectory;
+                if (!CanUsePostingMaskSidecar()) {
+                    m_postingMaskSidecarLoaded = false;
+                    return true;
+                }
+                if (m_listInfos.empty()) return true;
+
+                const std::string path = PostingMaskSidecarPath();
+                const auto startTime = std::chrono::steady_clock::now();
+                const size_t totalLists = m_listInfos.size();
+                const size_t progressStep = std::max<size_t>(1, (totalLists + 19) / 20);
+                size_t nextProgress = progressStep;
+                std::uint64_t pagesRead = 0;
+                std::uint64_t bytesRead = 0;
+                std::vector<std::uint64_t> offsets;
+                std::vector<std::uint32_t> vectorIDs;
+                std::vector<std::uint16_t> pageMasks;
+                auto logProgress = [&](size_t completedLists) {
+                    const double percent = totalLists == 0
+                        ? 100.0
+                        : (100.0 * static_cast<double>(completedLists) / static_cast<double>(totalLists));
+                    const size_t filled = std::min<size_t>(20, static_cast<size_t>(percent / 5.0));
+                    std::string bar(filled, '#');
+                    bar.resize(20, '.');
+                    const auto elapsedMs = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - startTime)
+                            .count());
+                    LOG(Helper::LogLevel::LL_Info,
+                        "Building posting mask sidecar [%s] %.1f%% lists=%zu/%zu entries=%zu pages_read=%llu bytes_read=%llu elapsed_ms=%llu path=%s\n",
+                        bar.c_str(),
+                        percent,
+                        completedLists,
+                        totalLists,
+                        vectorIDs.size(),
+                        static_cast<unsigned long long>(pagesRead),
+                        static_cast<unsigned long long>(bytesRead),
+                        static_cast<unsigned long long>(elapsedMs),
+                        path.c_str());
+                };
+
+                offsets.reserve(m_listInfos.size() + 1);
+                offsets.push_back(0);
+
+                LOG(Helper::LogLevel::LL_Info, "Building posting mask sidecar start lists=%zu path=%s\n", totalLists, path.c_str());
+                std::vector<char> buffer;
+                for (size_t postingID = 0; postingID < m_listInfos.size(); ++postingID)
+                {
+                    const ListInfo* listInfo = &(m_listInfos[postingID]);
+                    const size_t totalBytes = (static_cast<size_t>(listInfo->listPageCount) << PageSizeEx);
+                    if (listInfo->listEleCount > 0 && totalBytes > 0)
+                    {
+                        buffer.resize(totalBytes);
+                        const int fileid = m_oneContext ? 0 : static_cast<int>(postingID) / m_listPerFile;
+                        Helper::DiskIO* indexFile = m_indexFiles[fileid].get();
+                        auto numRead = indexFile->ReadBinary(totalBytes, buffer.data(), listInfo->listOffset);
+                        if (numRead != totalBytes) {
+                            LOG(Helper::LogLevel::LL_Error, "Failed to build posting mask sidecar: file %s read bytes, expected: %zu, actual: %llu.\n", m_extraFullGraphFile.c_str(), totalBytes, numRead);
+                            return false;
+                        }
+                        pagesRead += static_cast<std::uint64_t>(listInfo->listPageCount);
+                        bytesRead += static_cast<std::uint64_t>(totalBytes);
+
+                        char* p_postingListFullData = buffer.data() + listInfo->pageOffset;
+                        for (int i = 0; i < listInfo->listEleCount; ++i)
+                        {
+                            std::uint64_t offsetVectorID = 0;
+                            std::uint64_t offsetVector = 0;
+                            (this->*m_parsePosting)(offsetVectorID, offsetVector, i, listInfo->listEleCount);
+                            int vectorID = *(reinterpret_cast<int*>(p_postingListFullData + offsetVectorID));
+                            if (vectorID < 0) continue;
+
+                            vectorIDs.push_back(static_cast<std::uint32_t>(vectorID));
+                            pageMasks.push_back(PostingEntryPageMask(listInfo, i, offsetVectorID, offsetVector));
+                        }
+                    }
+                    offsets.push_back(static_cast<std::uint64_t>(vectorIDs.size()));
+                    const size_t completedLists = postingID + 1;
+                    if (completedLists >= nextProgress || completedLists == totalLists) {
+                        logProgress(completedLists);
+                        while (nextProgress <= completedLists) {
+                            nextProgress += progressStep;
+                        }
+                    }
+                }
+
+                const std::string tmpPath = path + ".tmp";
+                const auto scanElapsedMs = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - startTime)
+                        .count());
+                LOG(Helper::LogLevel::LL_Info,
+                    "Building posting mask sidecar scan complete lists=%zu entries=%zu pages_read=%llu bytes_read=%llu elapsed_ms=%llu path=%s\n",
+                    totalLists,
+                    vectorIDs.size(),
+                    static_cast<unsigned long long>(pagesRead),
+                    static_cast<unsigned long long>(bytesRead),
+                    static_cast<unsigned long long>(scanElapsedMs),
+                    path.c_str());
+                std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+                if (!out.is_open()) {
+                    LOG(Helper::LogLevel::LL_Error, "Failed to open posting mask sidecar for write: %s\n", tmpPath.c_str());
+                    return false;
+                }
+
+                const std::uint64_t magic = kPostingMaskSidecarMagic;
+                const std::uint32_t version = kPostingMaskSidecarVersion;
+                const std::uint32_t flags = kPostingMaskSidecarFlagPageMasks;
+                const std::uint64_t listCount = static_cast<std::uint64_t>(m_listInfos.size());
+                const std::uint64_t entryCount = static_cast<std::uint64_t>(vectorIDs.size());
+                const std::uint64_t sourceBytes = PostingMaskSourceBytes();
+                const std::uint64_t sourceTimestamp = PostingMaskSourceTimestamp();
+                WriteScalar(out, magic);
+                WriteScalar(out, version);
+                WriteScalar(out, flags);
+                WriteScalar(out, listCount);
+                WriteScalar(out, entryCount);
+                WriteScalar(out, sourceBytes);
+                WriteScalar(out, sourceTimestamp);
+                WriteVector(out, offsets);
+                WriteVector(out, vectorIDs);
+                WriteVector(out, pageMasks);
+                out.close();
+                if (!out.good()) {
+                    LOG(Helper::LogLevel::LL_Error, "Failed to write posting mask sidecar: %s\n", tmpPath.c_str());
+                    std::remove(tmpPath.c_str());
+                    return false;
+                }
+                std::remove(path.c_str());
+                if (std::rename(tmpPath.c_str(), path.c_str()) != 0) {
+                    LOG(Helper::LogLevel::LL_Error, "Failed to rename posting mask sidecar %s to %s\n", tmpPath.c_str(), path.c_str());
+                    std::remove(tmpPath.c_str());
+                    return false;
+                }
+
+                const auto elapsedMs = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - startTime)
+                        .count());
+                LOG(Helper::LogLevel::LL_Info,
+                    "Built posting mask sidecar lists=%zu entries=%zu pages_read=%llu bytes_read=%llu elapsed_ms=%llu path=%s\n",
+                    m_listInfos.size(),
+                    vectorIDs.size(),
+                    static_cast<unsigned long long>(pagesRead),
+                    static_cast<unsigned long long>(bytesRead),
+                    static_cast<unsigned long long>(elapsedMs),
+                    path.c_str());
+                return true;
+            }
+
+            bool LoadPostingMaskSidecar(const std::string& p_indexDirectory) override
+            {
+                (void)p_indexDirectory;
+                m_postingMaskSidecarLoaded = false;
+                m_postingMaskOffsets.clear();
+                m_postingMaskVectorIDs.clear();
+                m_postingMaskPageMasks.clear();
+
+                if (!CanUsePostingMaskSidecar()) return true;
+
+                const std::string path = PostingMaskSidecarPath();
+                std::ifstream in(path, std::ios::binary);
+                if (!in.is_open()) return false;
+
+                std::uint64_t magic = 0;
+                std::uint32_t version = 0;
+                std::uint32_t flags = 0;
+                std::uint64_t listCount = 0;
+                std::uint64_t entryCount = 0;
+                std::uint64_t sourceBytes = 0;
+                std::uint64_t sourceTimestamp = 0;
+                if (!ReadScalar(in, magic)
+                    || !ReadScalar(in, version)
+                    || !ReadScalar(in, flags)
+                    || !ReadScalar(in, listCount)
+                    || !ReadScalar(in, entryCount)
+                    || !ReadScalar(in, sourceBytes)
+                    || !ReadScalar(in, sourceTimestamp)
+                    || magic != kPostingMaskSidecarMagic
+                    || version != kPostingMaskSidecarVersion
+                    || listCount != static_cast<std::uint64_t>(m_listInfos.size())
+                    || sourceBytes != PostingMaskSourceBytes()
+                    || sourceTimestamp != PostingMaskSourceTimestamp())
+                {
+                    return false;
+                }
+
+                m_postingMaskOffsets.resize(static_cast<size_t>(listCount) + 1);
+                m_postingMaskVectorIDs.resize(static_cast<size_t>(entryCount));
+                m_postingMaskPageMasks.resize(static_cast<size_t>(entryCount));
+                if (!ReadVector(in, m_postingMaskOffsets)
+                    || !ReadVector(in, m_postingMaskVectorIDs)
+                    || !ReadVector(in, m_postingMaskPageMasks)
+                    || m_postingMaskOffsets.empty()
+                    || m_postingMaskOffsets.back() != entryCount)
+                {
+                    m_postingMaskOffsets.clear();
+                    m_postingMaskVectorIDs.clear();
+                    m_postingMaskPageMasks.clear();
+                    return false;
+                }
+                for (size_t i = 1; i < m_postingMaskOffsets.size(); ++i)
+                {
+                    if (m_postingMaskOffsets[i] < m_postingMaskOffsets[i - 1]
+                        || m_postingMaskOffsets[i] > entryCount)
+                    {
+                        m_postingMaskOffsets.clear();
+                        m_postingMaskVectorIDs.clear();
+                        m_postingMaskPageMasks.clear();
+                        return false;
+                    }
+                }
+
+                m_postingMaskSidecarLoaded = true;
+                m_postingMaskSidecarHasPageMasks =
+                    (flags & kPostingMaskSidecarFlagPageMasks) != 0
+                    && m_postingMaskPageMasks.size() == m_postingMaskVectorIDs.size()
+                    && CanUsePartialPostingPageReads();
+                LOG(Helper::LogLevel::LL_Info, "Loaded posting mask sidecar lists=%llu entries=%llu partial_pages=%s path=%s\n",
+                    static_cast<unsigned long long>(listCount),
+                    static_cast<unsigned long long>(entryCount),
+                    m_postingMaskSidecarHasPageMasks ? "true" : "false",
+                    path.c_str());
+                return true;
             }
 
         private:
-            struct ListInfo
+            static constexpr std::uint64_t kPostingMaskSidecarMagic = 0x3153434d4c515350ULL; // PSQLMCS1, little endian
+            static constexpr std::uint32_t kPostingMaskSidecarVersion = 2;
+            static constexpr std::uint32_t kPostingMaskSidecarFlagPageMasks = 1;
+
+            bool CanUsePostingMaskSidecar() const
             {
-                std::size_t listTotalBytes = 0;
-                
-                int listEleCount = 0;
+                return !m_enableDataCompression && m_vectorInfoSize > 0;
+            }
 
-                std::uint16_t listPageCount = 0;
+            bool CanUsePartialPostingPageReads() const
+            {
+                return CanUsePostingMaskSidecar()
+                    && !m_enablePostingListRearrange
+                    && !m_enableDeltaEncoding;
+            }
 
-                std::uint64_t listOffset = 0;
+            std::string PostingMaskSidecarPath() const
+            {
+                return m_extraFullGraphFile + ".tpsql_mask_sidecar";
+            }
 
-                std::uint16_t pageOffset = 0;
-            };
+            std::uint64_t PostingMaskSourceBytes() const
+            {
+                return TPSQL::FileSizeBytes(m_extraFullGraphFile);
+            }
+
+            std::uint64_t PostingMaskSourceTimestamp() const
+            {
+                std::error_code error;
+                const auto timestamp = std::filesystem::last_write_time(m_extraFullGraphFile, error);
+                if (error) return 0;
+                return static_cast<std::uint64_t>(timestamp.time_since_epoch().count());
+            }
+
+            template <typename TScalar>
+            static void WriteScalar(std::ofstream& out, TScalar value)
+            {
+                out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+            }
+
+            template <typename TVector>
+            static void WriteVector(std::ofstream& out, const std::vector<TVector>& values)
+            {
+                if (values.empty()) return;
+                out.write(
+                    reinterpret_cast<const char*>(values.data()),
+                    static_cast<std::streamsize>(sizeof(TVector) * values.size()));
+            }
+
+            template <typename TScalar>
+            static bool ReadScalar(std::ifstream& in, TScalar& value)
+            {
+                in.read(reinterpret_cast<char*>(&value), sizeof(value));
+                return in.good();
+            }
+
+            template <typename TVector>
+            static bool ReadVector(std::ifstream& in, std::vector<TVector>& values)
+            {
+                if (values.empty()) return true;
+                in.read(
+                    reinterpret_cast<char*>(values.data()),
+                    static_cast<std::streamsize>(sizeof(TVector) * values.size()));
+                return in.good();
+            }
+
+            static int CountBits(std::uint64_t value)
+            {
+                int count = 0;
+                while (value != 0)
+                {
+                    value &= value - 1;
+                    ++count;
+                }
+                return count;
+            }
+
+            std::uint64_t PageMaskForByteRange(std::uint64_t startByte, std::uint64_t endByte) const
+            {
+                const std::uint64_t firstPage = startByte >> PageSizeEx;
+                const std::uint64_t lastPage = endByte >> PageSizeEx;
+                if (lastPage >= 64) return UINT64_MAX;
+
+                std::uint64_t mask = 0;
+                for (std::uint64_t page = firstPage; page <= lastPage; ++page)
+                {
+                    mask |= (std::uint64_t(1) << page);
+                }
+                return mask;
+            }
+
+            std::uint16_t PostingEntryPageMask(
+                const ListInfo* listInfo,
+                int entryIndex,
+                std::uint64_t offsetVectorID,
+                std::uint64_t offsetVector) const
+            {
+                if (!CanUsePartialPostingPageReads()) return 0;
+
+                const std::uint64_t recordStart =
+                    static_cast<std::uint64_t>(listInfo->pageOffset)
+                    + static_cast<std::uint64_t>(entryIndex) * static_cast<std::uint64_t>(m_vectorInfoSize);
+                const std::uint64_t recordEnd =
+                    recordStart + static_cast<std::uint64_t>(m_vectorInfoSize) - 1;
+                const std::uint64_t vectorIdStart =
+                    static_cast<std::uint64_t>(listInfo->pageOffset) + offsetVectorID;
+                const std::uint64_t vectorEnd =
+                    static_cast<std::uint64_t>(listInfo->pageOffset)
+                    + offsetVector
+                    + static_cast<std::uint64_t>(m_iDataDimension) * sizeof(ValueType)
+                    - 1;
+                const std::uint64_t start = std::min(recordStart, vectorIdStart);
+                const std::uint64_t end = std::max(recordEnd, vectorEnd);
+                const std::uint64_t mask = PageMaskForByteRange(start, end);
+                if ((mask & ~std::uint64_t(UINT16_MAX)) != 0) return UINT16_MAX;
+                return static_cast<std::uint16_t>(mask);
+            }
+
+            bool BuildPartialReadRanges(
+                SizeType postingID,
+                const ExtraWorkSpace* p_exWorkSpace,
+                std::vector<PageReadRange>& ranges,
+                std::uint64_t& loadedPageMask) const
+            {
+                ranges.clear();
+                loadedPageMask = 0;
+                if (!m_postingMaskSidecarLoaded
+                    || !m_postingMaskSidecarHasPageMasks
+                    || p_exWorkSpace == nullptr
+                    || !p_exWorkSpace->HasVectorFilter()
+                    || postingID < 0
+                    || static_cast<size_t>(postingID + 1) >= m_postingMaskOffsets.size()
+                    || static_cast<size_t>(postingID) >= m_listInfos.size())
+                {
+                    return false;
+                }
+
+                const ListInfo* listInfo = &(m_listInfos[postingID]);
+                if (listInfo->listPageCount == 0 || listInfo->listPageCount > 16) return false;
+
+                const std::uint64_t validPageMask =
+                    (std::uint64_t(1) << listInfo->listPageCount) - 1;
+                const auto begin = m_postingMaskOffsets[postingID];
+                const auto end = m_postingMaskOffsets[postingID + 1];
+                for (std::uint64_t idx = begin; idx < end; ++idx)
+                {
+                    if (p_exWorkSpace->CheckVectorFilter(static_cast<SizeType>(m_postingMaskVectorIDs[idx]))) {
+                        loadedPageMask |= m_postingMaskPageMasks[idx];
+                    }
+                }
+                loadedPageMask &= validPageMask;
+                if (loadedPageMask == 0) return true;
+
+                int matchingPages = 0;
+                for (std::uint16_t page = 0; page < listInfo->listPageCount; ++page)
+                {
+                    if ((loadedPageMask & (std::uint64_t(1) << page)) == 0) continue;
+                    ++matchingPages;
+                    const std::uint16_t firstPage = page;
+                    std::uint16_t pageCount = 1;
+                    while (page + 1 < listInfo->listPageCount
+                        && (loadedPageMask & (std::uint64_t(1) << (page + 1))) != 0)
+                    {
+                        ++page;
+                        ++pageCount;
+                        ++matchingPages;
+                    }
+                    ranges.push_back(PageReadRange{firstPage, pageCount});
+                }
+
+                if (ranges.size() == 1 && matchingPages <= 3) return true;
+                if (ranges.size() <= 2 && matchingPages <= 2) return true;
+
+                ranges.clear();
+                loadedPageMask = 0;
+                return false;
+            }
 
             int LoadingHeadInfo(const std::string& p_file, int p_postingPageLimit, std::vector<ListInfo>& m_listInfos)
             {
+                const auto loadStart = std::chrono::steady_clock::now();
+                const std::uint64_t fileBytes = TPSQL::FileSizeBytes(p_file);
+                TPSQL::LogMemoryEvent(
+                    "sptag_spann",
+                    "ssd_header_load_start",
+                    "ExtraStaticSearcher::LoadingHeadInfo",
+                    p_file,
+                    fileBytes);
                 auto ptr = SPTAG::f_createIO();
                 if (ptr == nullptr || !ptr->Initialize(p_file.c_str(), std::ios::binary | std::ios::in)) {
                     LOG(Helper::LogLevel::LL_Error, "Failed to open file: %s\n", p_file.c_str());
@@ -898,6 +1404,22 @@ namespace SPTAG
                     biglistElementCount);
 
                 LOG(Helper::LogLevel::LL_Info, "Total Element Count: %llu\n", totalListElementCount);
+                const auto loadElapsedMs = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - loadStart)
+                        .count());
+                TPSQL::LogMemoryEvent(
+                    "sptag_spann",
+                    "ssd_header_load_finish",
+                    "ExtraStaticSearcher::LoadingHeadInfo",
+                    p_file,
+                    fileBytes,
+                    static_cast<std::uint64_t>(m_listCount) * sizeof(ListInfo),
+                    loadElapsedMs,
+                    "list_count=" + std::to_string(m_listCount)
+                        + " total_document_count=" + std::to_string(m_totalDocumentCount)
+                        + " total_list_element_count=" + std::to_string(totalListElementCount)
+                        + " biglist_count=" + std::to_string(biglistCount));
 
                 for (auto& ele : pageCountDist)
                 {
@@ -1320,6 +1842,11 @@ namespace SPTAG
             bool m_oneContext;
 
             std::vector<std::shared_ptr<Helper::DiskIO>> m_indexFiles;
+            bool m_postingMaskSidecarLoaded = false;
+            bool m_postingMaskSidecarHasPageMasks = false;
+            std::vector<std::uint64_t> m_postingMaskOffsets;
+            std::vector<std::uint32_t> m_postingMaskVectorIDs;
+            std::vector<std::uint16_t> m_postingMaskPageMasks;
             std::unique_ptr<Compressor> m_pCompressor;
             bool m_enableDeltaEncoding;
             bool m_enablePostingListRearrange;

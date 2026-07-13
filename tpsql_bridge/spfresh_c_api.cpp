@@ -1,11 +1,15 @@
 #include "SPFresh/tpsql_bridge/spfresh_c_api.h"
 
+#include "AnnService/inc/Core/Common/TpsqlMemoryLog.h"
 #include "AnnService/inc/Core/SPANN/Index.h"
 #include "AnnService/inc/Core/SearchQuery.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -15,6 +19,7 @@ struct tpsql_spfresh_index {
     uint32_t build_threads;
     uint32_t ssd_batches;
     uint32_t head_vector_count;
+    uint32_t search_internal_result_num;
     bool load_all_vectors;
     std::string index_dir;
     std::shared_ptr<SPTAG::VectorIndex> index;
@@ -53,12 +58,15 @@ bool configure_spann(
     uint32_t vector_count,
     uint32_t ssd_batches,
     uint32_t head_vector_count,
+    uint32_t search_internal_result_num,
     bool load_all_vectors)
 {
     const std::string build_threads_value = std::to_string(build_threads);
     const std::string dimension_value = std::to_string(dimension);
     const std::string vector_count_value = std::to_string(vector_count);
     const std::string ssd_batches_value = std::to_string(ssd_batches);
+    const std::string search_internal_result_num_value =
+        std::to_string(search_internal_result_num);
     const std::string head_vector_count_value =
         std::to_string(std::min(head_vector_count, vector_count));
     const char* build_head = rebuild_ssd_only ? "false" : "true";
@@ -91,9 +99,70 @@ bool configure_spann(
         && set_parameter(index, "PostingPageLimit", "12", "BuildSSDIndex")
         && set_parameter(index, "SearchPostingPageLimit", "12", "BuildSSDIndex")
         && set_parameter(index, "InternalResultNum", "64", "BuildSSDIndex")
-        && set_parameter(index, "SearchInternalResultNum", "64", "BuildSSDIndex")
+        && set_parameter(index, "SearchInternalResultNum", search_internal_result_num_value.c_str(), "BuildSSDIndex")
         && set_parameter(index, "Batches", ssd_batches_value.c_str(), "BuildSSDIndex")
         && set_parameter(index, "LoadAllVectors", load_all_vectors_value, "BuildSSDIndex");
+}
+
+bool configure_runtime_search_spann(
+    const std::shared_ptr<SPTAG::VectorIndex>& index,
+    uint32_t search_internal_result_num)
+{
+    const std::string search_internal_result_num_value =
+        std::to_string(search_internal_result_num);
+    return set_parameter(index, "SearchInternalResultNum", search_internal_result_num_value.c_str(), "BuildSSDIndex");
+}
+
+bool ensure_posting_mask_sidecar(
+    const std::shared_ptr<SPTAG::VectorIndex>& index,
+    const std::string& index_dir,
+    bool rebuild)
+{
+    auto spann = std::dynamic_pointer_cast<SPTAG::SPANN::Index<float>>(index);
+    if (spann == nullptr || spann->GetDiskIndex() == nullptr) return true;
+
+    auto disk_index = spann->GetDiskIndex();
+    if (rebuild) {
+        return disk_index->BuildPostingMaskSidecar(index_dir)
+            && disk_index->LoadPostingMaskSidecar(index_dir);
+    }
+    if (disk_index->LoadPostingMaskSidecar(index_dir)) return true;
+    const auto sidecar_path =
+        (std::filesystem::path(index_dir) / "SPTAGFullList.bin.tpsql_mask_sidecar").string();
+    const auto probe_path = sidecar_path + ".write_probe";
+    {
+        std::ofstream probe(probe_path, std::ios::binary | std::ios::trunc);
+        if (!probe.is_open()) {
+            std::fprintf(
+                stderr,
+                "ERROR: SPFresh posting mask sidecar is required but missing, stale, or unreadable; refusing to start without masked-posting optimization. Index directory is not writable, so the sidecar cannot be rebuilt here. Build it on a writable indexer first. index_dir=%s sidecar=%s\n",
+                index_dir.c_str(),
+                sidecar_path.c_str());
+            return false;
+        }
+    }
+    std::error_code remove_error;
+    std::filesystem::remove(probe_path, remove_error);
+    std::fprintf(
+        stderr,
+        "INFO: SPFresh posting mask sidecar is required but missing, stale, or unreadable; rebuilding before serving. index_dir=%s sidecar=%s\n",
+        index_dir.c_str(),
+        sidecar_path.c_str());
+    return disk_index->BuildPostingMaskSidecar(index_dir)
+        && disk_index->LoadPostingMaskSidecar(index_dir);
+}
+
+bool load_or_build_posting_mask_sidecar(
+    const std::shared_ptr<SPTAG::VectorIndex>& index,
+    const std::string& index_dir)
+{
+    auto spann = std::dynamic_pointer_cast<SPTAG::SPANN::Index<float>>(index);
+    if (spann == nullptr || spann->GetDiskIndex() == nullptr) return true;
+
+    auto disk_index = spann->GetDiskIndex();
+    if (disk_index->LoadPostingMaskSidecar(index_dir)) return true;
+    return disk_index->BuildPostingMaskSidecar(index_dir)
+        && disk_index->LoadPostingMaskSidecar(index_dir);
 }
 
 bool write_loader_config(
@@ -161,6 +230,7 @@ tpsql_spfresh_status build_spann(
                 vector_count,
                 handle->ssd_batches,
                 handle->head_vector_count,
+                handle->search_internal_result_num,
                 handle->load_all_vectors)) {
             return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to configure SPFresh index");
         }
@@ -176,6 +246,12 @@ tpsql_spfresh_status build_spann(
                 handle,
                 TPSQL_SPFRESH_BUILD_FAILED,
                 "SPFresh BuildIndex failed with error code " + std::to_string(static_cast<int>(status)));
+        }
+        if (!ensure_posting_mask_sidecar(index, handle->index_dir, true)) {
+            return set_error(
+                handle,
+                TPSQL_SPFRESH_BUILD_FAILED,
+                "failed to build SPFresh posting mask sidecar");
         }
         if (!write_loader_config(index, handle->index_dir)) {
             return set_error(
@@ -245,6 +321,7 @@ tpsql_spfresh_status build_spann_from_files(
                 vector_count,
                 handle->ssd_batches,
                 handle->head_vector_count,
+                handle->search_internal_result_num,
                 handle->load_all_vectors)) {
             return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to configure SPFresh index");
         }
@@ -255,6 +332,12 @@ tpsql_spfresh_status build_spann_from_files(
                 handle,
                 TPSQL_SPFRESH_BUILD_FAILED,
                 "SPFresh file BuildIndex failed with error code " + std::to_string(static_cast<int>(status)));
+        }
+        if (!ensure_posting_mask_sidecar(index, handle->index_dir, true)) {
+            return set_error(
+                handle,
+                TPSQL_SPFRESH_BUILD_FAILED,
+                "failed to build SPFresh posting mask sidecar");
         }
         if (!write_loader_config(index, handle->index_dir)) {
             return set_error(
@@ -281,13 +364,15 @@ extern "C" tpsql_spfresh_index* tpsql_spfresh_create(
     uint32_t build_threads,
     uint32_t ssd_batches,
     uint32_t head_vector_count,
+    uint32_t search_internal_result_num,
     int load_all_vectors)
 {
     if (dimension == 0
         || index_dir == nullptr
         || index_dir[0] == '\0'
         || build_threads == 0
-        || ssd_batches == 0) {
+        || ssd_batches == 0
+        || search_internal_result_num == 0) {
         return nullptr;
     }
 
@@ -297,6 +382,7 @@ extern "C" tpsql_spfresh_index* tpsql_spfresh_create(
         handle->build_threads = build_threads;
         handle->ssd_batches = ssd_batches;
         handle->head_vector_count = head_vector_count;
+        handle->search_internal_result_num = search_internal_result_num;
         handle->load_all_vectors = load_all_vectors != 0;
         handle->index_dir = index_dir;
         return handle;
@@ -362,12 +448,42 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_load_existing(tpsql_spfresh_index*
         }
 
         std::shared_ptr<SPTAG::VectorIndex> index;
+        const auto load_start = std::chrono::steady_clock::now();
+        SPTAG::TPSQL::LogMemoryEvent(
+            "bridge",
+            "load_existing_start",
+            "VectorIndex::LoadIndex",
+            handle->index_dir);
         SPTAG::ErrorCode status = SPTAG::VectorIndex::LoadIndex(handle->index_dir, index);
+        const auto load_elapsed_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - load_start)
+                .count());
+        SPTAG::TPSQL::LogMemoryEvent(
+            "bridge",
+            "load_existing_finish",
+            "VectorIndex::LoadIndex",
+            handle->index_dir,
+            SPTAG::TPSQL::UnknownBytes,
+            SPTAG::TPSQL::UnknownBytes,
+            load_elapsed_ms);
         if (status != SPTAG::ErrorCode::Success || index == nullptr) {
             return set_error(
                 handle,
                 TPSQL_SPFRESH_BUILD_FAILED,
                 "SPFresh LoadIndex failed with error code " + std::to_string(static_cast<int>(status)));
+        }
+        if (!configure_runtime_search_spann(index, handle->search_internal_result_num)) {
+            return set_error(
+                handle,
+                TPSQL_SPFRESH_BUILD_FAILED,
+                "failed to configure SPFresh runtime search parameters");
+        }
+        if (!ensure_posting_mask_sidecar(index, handle->index_dir, false)) {
+            return set_error(
+                handle,
+                TPSQL_SPFRESH_BUILD_FAILED,
+                "SPFresh posting mask sidecar is required but missing, stale, or unreadable; run sidecar build on a writable indexer before starting search");
         }
         handle->dimension = static_cast<uint32_t>(index->GetFeatureDim());
         handle->index = std::move(index);
@@ -377,6 +493,28 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_load_existing(tpsql_spfresh_index*
         return set_error(handle, TPSQL_SPFRESH_EXCEPTION, error.what());
     } catch (...) {
         return set_error(handle, TPSQL_SPFRESH_EXCEPTION, "unknown SPFresh load exception");
+    }
+}
+
+extern "C" tpsql_spfresh_status tpsql_spfresh_ensure_posting_mask_sidecar(tpsql_spfresh_index* handle)
+{
+    if (handle == nullptr || handle->index == nullptr) {
+        return set_error(handle, TPSQL_SPFRESH_INVALID_ARGUMENT, "invalid SPFresh sidecar arguments");
+    }
+
+    try {
+        if (!load_or_build_posting_mask_sidecar(handle->index, handle->index_dir)) {
+            return set_error(
+                handle,
+                TPSQL_SPFRESH_BUILD_FAILED,
+                "failed to load or build SPFresh posting mask sidecar");
+        }
+        handle->last_error.clear();
+        return TPSQL_SPFRESH_OK;
+    } catch (const std::exception& error) {
+        return set_error(handle, TPSQL_SPFRESH_EXCEPTION, error.what());
+    } catch (...) {
+        return set_error(handle, TPSQL_SPFRESH_EXCEPTION, "unknown SPFresh sidecar exception");
     }
 }
 

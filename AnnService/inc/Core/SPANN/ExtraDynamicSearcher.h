@@ -1101,8 +1101,53 @@ namespace SPTAG::SPANN {
             LOG(Helper::LogLevel::LL_Info, "DataBlockSize: %d, Capacity: %d\n", m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
 
             if (!m_opt->m_useSPDK) {
-                m_versionMap->Load(m_opt->m_deleteIDFile, m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
-                m_postingSizes.Load(m_opt->m_ssdInfoFile, m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
+                const std::uint64_t deleteFileBytes = TPSQL::FileSizeBytes(m_opt->m_deleteIDFile);
+                const auto versionLoadStart = std::chrono::steady_clock::now();
+                TPSQL::LogMemoryEvent(
+                    "sptag_spann",
+                    "dynamic_partial_load_start",
+                    "ExtraDynamicSearcher::VersionLabel::Load",
+                    m_opt->m_deleteIDFile,
+                    deleteFileBytes);
+                const ErrorCode versionLoadStatus =
+                    m_versionMap->Load(m_opt->m_deleteIDFile, m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
+                const auto versionLoadElapsedMs = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - versionLoadStart)
+                        .count());
+                TPSQL::LogMemoryEvent(
+                    "sptag_spann",
+                    "dynamic_partial_load_finish",
+                    "ExtraDynamicSearcher::VersionLabel::Load",
+                    m_opt->m_deleteIDFile,
+                    deleteFileBytes,
+                    m_versionMap->BufferSize(),
+                    versionLoadElapsedMs,
+                    "status=" + std::to_string(static_cast<int>(versionLoadStatus)));
+
+                const std::uint64_t ssdInfoFileBytes = TPSQL::FileSizeBytes(m_opt->m_ssdInfoFile);
+                const auto postingLoadStart = std::chrono::steady_clock::now();
+                TPSQL::LogMemoryEvent(
+                    "sptag_spann",
+                    "dynamic_partial_load_start",
+                    "ExtraDynamicSearcher::PostingSizeRecord::Load",
+                    m_opt->m_ssdInfoFile,
+                    ssdInfoFileBytes);
+                const ErrorCode postingLoadStatus =
+                    m_postingSizes.Load(m_opt->m_ssdInfoFile, m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
+                const auto postingLoadElapsedMs = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - postingLoadStart)
+                        .count());
+                TPSQL::LogMemoryEvent(
+                    "sptag_spann",
+                    "dynamic_partial_load_finish",
+                    "ExtraDynamicSearcher::PostingSizeRecord::Load",
+                    m_opt->m_ssdInfoFile,
+                    ssdInfoFileBytes,
+                    m_postingSizes.BufferSize(),
+                    postingLoadElapsedMs,
+                    "status=" + std::to_string(static_cast<int>(postingLoadStatus)));
                 LOG(Helper::LogLevel::LL_Info, "Current vector num: %d.\n", m_versionMap->GetVectorNum());
                 LOG(Helper::LogLevel::LL_Info, "Current posting num: %d.\n", m_postingSizes.GetPostingNum());
             }

@@ -2,9 +2,11 @@
 // Licensed under the MIT License.
 
 #include "inc/Helper/VectorSetReaders/DefaultReader.h"
+#include "inc/Core/Common/TpsqlMemoryLog.h"
 #include "inc/Helper/CommonHelper.h"
 
 #include <algorithm>
+#include <chrono>
 
 using namespace SPTAG;
 using namespace SPTAG::Helper;
@@ -97,7 +99,36 @@ DefaultVectorReader::GetVectorSet(SizeType start, SizeType end) const
     std::uint64_t totalRecordVectorBytes = ((std::uint64_t)GetValueTypeSize(m_options->m_inputValueType)) * (end - start) * col;
     ByteArray vectorSet;
     if (totalRecordVectorBytes > 0) {
+        const auto allocStart = std::chrono::steady_clock::now();
+        SPTAG::TPSQL::LogMemoryEvent(
+            "sptag_vector_reader",
+            "vector_buffer_alloc_start",
+            "DefaultVectorReader::GetVectorSet",
+            std::string(),
+            SPTAG::TPSQL::UnknownBytes,
+            totalRecordVectorBytes,
+            SPTAG::TPSQL::UnknownBytes,
+            "source_count=" + std::to_string(sources.size())
+                + " start=" + std::to_string(start)
+                + " end=" + std::to_string(end)
+                + " cache_full_range=" + std::string(cacheFullRange ? "true" : "false"));
         vectorSet = ByteArray::Alloc(totalRecordVectorBytes);
+        const auto allocElapsedMs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - allocStart)
+                .count());
+        SPTAG::TPSQL::LogMemoryEvent(
+            "sptag_vector_reader",
+            "vector_buffer_alloc_finish",
+            "DefaultVectorReader::GetVectorSet",
+            std::string(),
+            SPTAG::TPSQL::UnknownBytes,
+            totalRecordVectorBytes,
+            allocElapsedMs,
+            "source_count=" + std::to_string(sources.size())
+                + " start=" + std::to_string(start)
+                + " end=" + std::to_string(end)
+                + " cache_full_range=" + std::string(cacheFullRange ? "true" : "false"));
         char* vecBuf = reinterpret_cast<char*>(vectorSet.Data());
         std::uint64_t copiedBytes = 0;
         const std::uint64_t vectorBytes = ((std::uint64_t)GetValueTypeSize(m_options->m_inputValueType)) * col;
@@ -113,7 +144,21 @@ DefaultVectorReader::GetVectorSet(SizeType start, SizeType end) const
             const SizeType readRows = readEnd - readStart;
             const std::uint64_t readBytes = vectorBytes * readRows;
             const std::uint64_t offset = vectorBytes * localStart + sizeof(SizeType) + sizeof(DimensionType);
+            const std::uint64_t sourceFileBytes = SPTAG::TPSQL::FileSizeBytes(source.path);
 
+            const auto readStartTime = std::chrono::steady_clock::now();
+            SPTAG::TPSQL::LogMemoryEvent(
+                "sptag_vector_reader",
+                "vector_file_heap_read_start",
+                "DefaultVectorReader::GetVectorSet",
+                source.path,
+                sourceFileBytes,
+                readBytes,
+                SPTAG::TPSQL::UnknownBytes,
+                "read_rows=" + std::to_string(readRows)
+                    + " read_start=" + std::to_string(readStart)
+                    + " read_end=" + std::to_string(readEnd)
+                    + " file_offset=" + std::to_string(offset));
             auto ptr = f_createIO();
             if (ptr == nullptr || !ptr->Initialize(source.path.c_str(), std::ios::binary | std::ios::in)) {
                 LOG(Helper::LogLevel::LL_Error, "Failed to read file %s.\n", source.path.c_str());
@@ -124,6 +169,22 @@ DefaultVectorReader::GetVectorSet(SizeType start, SizeType end) const
                 throw std::runtime_error("Failed read file");
             }
             copiedBytes += readBytes;
+            const auto readElapsedMs = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - readStartTime)
+                    .count());
+            SPTAG::TPSQL::LogMemoryEvent(
+                "sptag_vector_reader",
+                "vector_file_heap_read_finish",
+                "DefaultVectorReader::GetVectorSet",
+                source.path,
+                sourceFileBytes,
+                readBytes,
+                readElapsedMs,
+                "read_rows=" + std::to_string(readRows)
+                    + " read_start=" + std::to_string(readStart)
+                    + " read_end=" + std::to_string(readEnd)
+                    + " file_offset=" + std::to_string(offset));
         }
     }
 

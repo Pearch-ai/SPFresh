@@ -303,6 +303,11 @@ namespace SPTAG {
                 return m_vectorFilter == nullptr || m_vectorFilter->Contains(p_vectorID);
             }
 
+            inline bool HasVectorFilter() const
+            {
+                return m_vectorFilter != nullptr || m_vectorFilterBits != nullptr;
+            }
+
             std::vector<int> m_postingIDs;
 
             COMMON::OptHashPosVector m_deduper;
@@ -391,6 +396,9 @@ namespace SPTAG {
             virtual void ForceCompaction() { return; }
 
             virtual bool CheckValidPosting(SizeType postingID) = 0;
+            virtual bool CheckPostingFilter(SizeType postingID, const ExtraWorkSpace* p_exWorkSpace) const { return true; }
+            virtual bool BuildPostingMaskSidecar(const std::string& p_indexDirectory) { return true; }
+            virtual bool LoadPostingMaskSidecar(const std::string& p_indexDirectory) { return true; }
             virtual SizeType SearchVector(std::shared_ptr<VectorSet>& p_vectorSet,
                 std::shared_ptr<VectorIndex> p_index, int testNum = 64, SizeType VID = -1) { return -1; }
             virtual void ForceGC(VectorIndex* p_index) { return; }

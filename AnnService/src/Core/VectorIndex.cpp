@@ -7,9 +7,12 @@
 #include "inc/Helper/SimpleIniReader.h"
 #include "inc/Helper/ConcurrentSet.h"
 
+#include "inc/Core/Common/TpsqlMemoryLog.h"
 #include "inc/Core/BKT/Index.h"
 #include "inc/Core/KDT/Index.h"
 #include "inc/Core/SPANN/Index.h"
+
+#include <chrono>
 
 typedef typename SPTAG::Helper::Concurrent::ConcurrentMap<std::string, SPTAG::SizeType> MetadataMap;
 
@@ -618,16 +621,56 @@ VectorIndex::LoadIndex(const std::string& p_loaderFilePath, std::shared_ptr<Vect
         indexfiles->push_back(p_vectorIndex->m_sQuantizerFile);
     }
     std::vector<std::shared_ptr<Helper::DiskIO>> handles;
+    std::uint64_t totalFileBytes = 0;
+    bool totalFileBytesKnown = true;
     for (std::string& f : *indexfiles) {
+        const std::string path = folderPath + f;
+        const std::uint64_t fileBytes = TPSQL::FileSizeBytes(path);
+        if (fileBytes == TPSQL::UnknownBytes) {
+            totalFileBytesKnown = false;
+        }
+        else {
+            totalFileBytes += fileBytes;
+        }
+        TPSQL::LogMemoryEvent(
+            "sptag",
+            "load_index_file",
+            "VectorIndex::LoadIndexData",
+            path,
+            fileBytes);
         auto ptr = SPTAG::f_createIO();
-        if (ptr == nullptr || !ptr->Initialize((folderPath + f).c_str(), std::ios::binary | std::ios::in)) {
-            LOG(Helper::LogLevel::LL_Error, "Cannot open file %s!\n", (folderPath + f).c_str());
+        if (ptr == nullptr || !ptr->Initialize(path.c_str(), std::ios::binary | std::ios::in)) {
+            LOG(Helper::LogLevel::LL_Error, "Cannot open file %s!\n", path.c_str());
             ptr = nullptr;
         }
         handles.push_back(std::move(ptr));
     }
 
-    if ((ret = p_vectorIndex->LoadIndexData(handles)) != ErrorCode::Success) return ret;
+    const auto loadStart = std::chrono::steady_clock::now();
+    TPSQL::LogMemoryEvent(
+        "sptag",
+        "load_index_data_start",
+        "VectorIndex::LoadIndexData",
+        folderPath,
+        totalFileBytesKnown ? totalFileBytes : TPSQL::UnknownBytes,
+        TPSQL::UnknownBytes,
+        TPSQL::UnknownBytes,
+        "file_count=" + std::to_string(indexfiles->size()));
+    ret = p_vectorIndex->LoadIndexData(handles);
+    const auto loadElapsedMs = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - loadStart)
+            .count());
+    TPSQL::LogMemoryEvent(
+        "sptag",
+        "load_index_data_finish",
+        "VectorIndex::LoadIndexData",
+        folderPath,
+        totalFileBytesKnown ? totalFileBytes : TPSQL::UnknownBytes,
+        TPSQL::UnknownBytes,
+        loadElapsedMs,
+        "status=" + std::to_string(static_cast<int>(ret)));
+    if (ret != ErrorCode::Success) return ret;
 
     size_t metaStart = p_vectorIndex->GetIndexFiles()->size();
     if (iniReader.DoesSectionExist("MetaData"))

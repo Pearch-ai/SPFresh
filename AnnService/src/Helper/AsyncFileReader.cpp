@@ -3,6 +3,8 @@
 
 #include "inc/Helper/AsyncFileReader.h"
 
+#include <cerrno>
+
 namespace SPTAG {
     namespace Helper {
 #ifndef _MSC_VER
@@ -77,6 +79,8 @@ namespace SPTAG {
             }
             std::vector<struct io_event> events(totalToSubmit);
             int totalDone = 0, totalSubmitted = 0, totalQueued = 0;
+            int submitRetryCount = 0, submitEagainCount = 0, submitOtherErrorCount = 0;
+            int firstSubmitError = 0, lastSubmitError = 0;
             while (totalDone < totalToSubmit) {
                 if (totalSubmitted < totalToSubmit) {
                     for (int i = 0; i < handlers.size(); i++) {
@@ -88,7 +92,40 @@ namespace SPTAG {
                                 totalSubmitted += s;
                             }
                             else {
-                                LOG(Helper::LogLevel::LL_Error, "fid:%d channel %d, to submit:%d, submitted:%s\n", i, channel, iocbs[i].size() - submitted[i], strerror(-s));
+                                // syscall() reports failure as -1 and stores the actual cause in errno.
+                                // strerror(-s) therefore always rendered errno 1 (EPERM), masking queue
+                                // pressure and every other io_submit failure as "Operation not permitted".
+                                const int submitError = s < 0 ? errno : 0;
+                                submitRetryCount++;
+                                if (submitError == EAGAIN) {
+                                    submitEagainCount++;
+                                }
+                                else {
+                                    submitOtherErrorCount++;
+                                }
+                                if (submitRetryCount == 1) {
+                                    firstSubmitError = submitError;
+                                }
+
+                                // Report the first retry and any change in errno. Repeated EAGAIN while
+                                // the AIO queue drains is summarized once after the batch completes.
+                                if (submitRetryCount == 1 || submitError != lastSubmitError) {
+                                    const char* errorMessage =
+                                        s < 0 ? strerror(submitError) : "io_submit made no progress";
+                                    const auto logLevel = submitError == EAGAIN
+                                        ? Helper::LogLevel::LL_Warning
+                                        : Helper::LogLevel::LL_Error;
+                                    LOG(logLevel,
+                                        "aio_submit retry fid:%d channel:%d pending:%d errno:%d error:%s total_submitted:%d total_done:%d\n",
+                                        i,
+                                        channel,
+                                        static_cast<int>(iocbs[i].size()) - submitted[i],
+                                        submitError,
+                                        errorMessage,
+                                        totalSubmitted,
+                                        totalDone);
+                                }
+                                lastSubmitError = submitError;
                             }
                         }
                     }
@@ -112,6 +149,17 @@ namespace SPTAG {
                         totalDone += d;
                     }
                 }
+            }
+
+            if (submitRetryCount > 0) {
+                LOG(Helper::LogLevel::LL_Warning,
+                    "aio_submit batch summary requests:%d retries:%d eagain:%d other_errors:%d first_errno:%d last_errno:%d\n",
+                    totalToSubmit,
+                    submitRetryCount,
+                    submitEagainCount,
+                    submitOtherErrorCount,
+                    firstSubmitError,
+                    lastSubmitError);
             }
 
             for (int i = totalQueued; i < totalDone; i++) {

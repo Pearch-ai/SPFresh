@@ -28,6 +28,7 @@ tpsql_spfresh_index* tpsql_spfresh_create(
     uint32_t build_threads,
     uint32_t ssd_batches,
     uint32_t head_vector_count,
+    uint32_t search_internal_result_num,
     int load_all_vectors);
 void tpsql_spfresh_destroy(tpsql_spfresh_index* index);
 
@@ -52,6 +53,8 @@ tpsql_spfresh_status tpsql_spfresh_rebuild_ssd_from_files(
     uint32_t vector_count);
 
 tpsql_spfresh_status tpsql_spfresh_load_existing(tpsql_spfresh_index* index);
+
+tpsql_spfresh_status tpsql_spfresh_ensure_posting_mask_sidecar(tpsql_spfresh_index* index);
 
 tpsql_spfresh_status tpsql_spfresh_search(
     tpsql_spfresh_index* index,

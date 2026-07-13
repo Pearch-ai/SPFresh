@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "inc/Core/SPANN/Index.h"
+#include "inc/Core/Common/TpsqlMemoryLog.h"
 #include "inc/Helper/VectorSetReaders/MemoryReader.h"
 #include "inc/Core/SPANN/ExtraStaticSearcher.h"
 #include "inc/Core/SPANN/ExtraDynamicSearcher.h"
@@ -123,7 +124,27 @@ namespace SPTAG
         ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::DiskIO>>& p_indexStreams)
         {
             m_index->SetQuantizer(m_pQuantizer);
-            if (m_index->LoadIndexData(p_indexStreams) != ErrorCode::Success) return ErrorCode::Fail;
+            const auto headLoadStart = std::chrono::steady_clock::now();
+            TPSQL::LogMemoryEvent(
+                "sptag_spann",
+                "head_index_load_start",
+                "SPANN::Index::LoadIndexData",
+                m_options.m_indexDirectory + FolderSep + m_options.m_headIndexFolder);
+            const ErrorCode headLoadStatus = m_index->LoadIndexData(p_indexStreams);
+            const auto headLoadElapsedMs = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - headLoadStart)
+                    .count());
+            TPSQL::LogMemoryEvent(
+                "sptag_spann",
+                "head_index_load_finish",
+                "SPANN::Index::LoadIndexData",
+                m_options.m_indexDirectory + FolderSep + m_options.m_headIndexFolder,
+                TPSQL::UnknownBytes,
+                TPSQL::UnknownBytes,
+                headLoadElapsedMs,
+                "status=" + std::to_string(static_cast<int>(headLoadStatus)));
+            if (headLoadStatus != ErrorCode::Success) return ErrorCode::Fail;
 
             m_index->SetParameter("NumberOfThreads", std::to_string(m_options.m_iSSDNumberOfThreads));
             m_index->SetParameter("MaxCheck", std::to_string(m_options.m_maxCheck));
@@ -154,11 +175,55 @@ namespace SPTAG
                 }
             }
 
-            if (!m_extraSearcher->LoadIndex(m_options, m_versionMap)) return ErrorCode::Fail;
+            const auto extraLoadStart = std::chrono::steady_clock::now();
+            TPSQL::LogMemoryEvent(
+                "sptag_spann",
+                "extra_searcher_load_start",
+                "SPANN::ExtraSearcher::LoadIndex",
+                m_options.m_indexDirectory + FolderSep + m_options.m_ssdIndex);
+            const bool extraLoaded = m_extraSearcher->LoadIndex(m_options, m_versionMap);
+            const auto extraLoadElapsedMs = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - extraLoadStart)
+                    .count());
+            TPSQL::LogMemoryEvent(
+                "sptag_spann",
+                "extra_searcher_load_finish",
+                "SPANN::ExtraSearcher::LoadIndex",
+                m_options.m_indexDirectory + FolderSep + m_options.m_ssdIndex,
+                TPSQL::UnknownBytes,
+                TPSQL::UnknownBytes,
+                extraLoadElapsedMs,
+                std::string("status=") + (extraLoaded ? "ok" : "fail"));
+            if (!extraLoaded) return ErrorCode::Fail;
 
             if (m_options.m_excludehead) {
+                const std::uint64_t translateBytes =
+                    sizeof(std::uint64_t) * static_cast<std::uint64_t>(m_index->GetNumSamples());
+                const std::string headIdPath = m_options.m_indexDirectory + FolderSep + m_options.m_headIDFile;
+                const std::uint64_t headIdFileBytes = TPSQL::FileSizeBytes(headIdPath);
+                const auto translateLoadStart = std::chrono::steady_clock::now();
+                TPSQL::LogMemoryEvent(
+                    "sptag_spann",
+                    "head_id_translate_load_start",
+                    "SPANN::Index::LoadIndexData",
+                    headIdPath,
+                    headIdFileBytes,
+                    translateBytes);
                 m_vectorTranslateMap.reset(new std::uint64_t[m_index->GetNumSamples()], std::default_delete<std::uint64_t[]>());
-                IOBINARY(p_indexStreams[m_index->GetIndexFiles()->size()], ReadBinary, sizeof(std::uint64_t) * m_index->GetNumSamples(), reinterpret_cast<char*>(m_vectorTranslateMap.get()));
+                IOBINARY(p_indexStreams[m_index->GetIndexFiles()->size()], ReadBinary, translateBytes, reinterpret_cast<char*>(m_vectorTranslateMap.get()));
+                const auto translateLoadElapsedMs = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - translateLoadStart)
+                        .count());
+                TPSQL::LogMemoryEvent(
+                    "sptag_spann",
+                    "head_id_translate_load_finish",
+                    "SPANN::Index::LoadIndexData",
+                    headIdPath,
+                    headIdFileBytes,
+                    translateBytes,
+                    translateLoadElapsedMs);
             }
 
             omp_set_num_threads(m_options.m_iSSDNumberOfThreads);
@@ -384,7 +449,8 @@ namespace SPTAG
                     // Don't do disk reads for irrelevant pages
                     if (m_workspace->m_postingIDs.size() >= m_options.m_searchInternalResultNum ||
                         (limitDist > 0.1 && headDist > limitDist) ||
-                        !m_extraSearcher->CheckValidPosting(postingID))
+                        !m_extraSearcher->CheckValidPosting(postingID) ||
+                        !m_extraSearcher->CheckPostingFilter(postingID, m_workspace.get()))
                         continue;
                     m_workspace->m_postingIDs.emplace_back(postingID);
                 }
@@ -449,7 +515,8 @@ namespace SPTAG
             {
                 auto res = p_queryResults->GetResult(i);
                 if (res->VID == -1 || (limitDist > 0.1 && res->Dist > limitDist)) break;
-                if (m_extraSearcher->CheckValidPosting(res->VID))
+                if (m_extraSearcher->CheckValidPosting(res->VID)
+                    && m_extraSearcher->CheckPostingFilter(res->VID, m_workspace.get()))
                 {
                     m_workspace->m_postingIDs.emplace_back(res->VID);
                 }
@@ -529,7 +596,8 @@ namespace SPTAG
                 {
                     auto res = p_query.GetResult(i);
                     if (res->VID == -1 || (limitDist > 0.1 && res->Dist > limitDist)) break;
-                    if (!m_extraSearcher->CheckValidPosting(res->VID)) continue;
+                    if (!m_extraSearcher->CheckValidPosting(res->VID)
+                        || !m_extraSearcher->CheckPostingFilter(res->VID, m_workspace.get())) continue;
                     m_workspace->m_postingIDs.emplace_back(res->VID);
                 }
 
