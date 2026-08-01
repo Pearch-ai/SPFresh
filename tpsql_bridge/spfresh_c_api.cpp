@@ -6,16 +6,19 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <system_error>
 
 struct tpsql_spfresh_index {
     uint32_t dimension;
+    tpsql_spfresh_value_type value_type;
     uint32_t build_threads;
     uint32_t ssd_batches;
     uint32_t head_vector_count;
@@ -27,6 +30,28 @@ struct tpsql_spfresh_index {
 };
 
 namespace {
+
+SPTAG::VectorValueType native_value_type(tpsql_spfresh_value_type value_type)
+{
+    switch (value_type) {
+    case TPSQL_SPFRESH_FLOAT32:
+        return SPTAG::VectorValueType::Float;
+    case TPSQL_SPFRESH_INT8:
+        return SPTAG::VectorValueType::Int8;
+    }
+    return SPTAG::VectorValueType::Undefined;
+}
+
+const char* value_type_name(tpsql_spfresh_value_type value_type)
+{
+    switch (value_type) {
+    case TPSQL_SPFRESH_FLOAT32:
+        return "Float";
+    case TPSQL_SPFRESH_INT8:
+        return "Int8";
+    }
+    return "Undefined";
+}
 
 tpsql_spfresh_status set_error(
     tpsql_spfresh_index* handle,
@@ -75,8 +100,10 @@ bool configure_spann(
     const char* select_threshold_value = has_head_vector_target ? "0" : "6";
     const char* split_factor_value = has_head_vector_target ? "0" : "5";
     const char* split_threshold_value = has_head_vector_target ? "0" : "25";
+    const auto value_type = index->GetVectorValueType();
+    const char* value_type_value = value_type == SPTAG::VectorValueType::Int8 ? "Int8" : "Float";
     return set_parameter(index, "IndexAlgoType", "BKT", "Base")
-        && set_parameter(index, "ValueType", "Float", "Base")
+        && set_parameter(index, "ValueType", value_type_value, "Base")
         && set_parameter(index, "DistCalcMethod", "L2", "Base")
         && set_parameter(index, "Dim", dimension_value.c_str(), "Base")
         && set_parameter(index, "VectorPath", vector_paths == nullptr ? "" : vector_paths, "Base")
@@ -113,12 +140,13 @@ bool configure_runtime_search_spann(
     return set_parameter(index, "SearchInternalResultNum", search_internal_result_num_value.c_str(), "BuildSSDIndex");
 }
 
-bool ensure_posting_mask_sidecar(
+template <typename T>
+bool ensure_posting_mask_sidecar_typed(
     const std::shared_ptr<SPTAG::VectorIndex>& index,
     const std::string& index_dir,
     bool rebuild)
 {
-    auto spann = std::dynamic_pointer_cast<SPTAG::SPANN::Index<float>>(index);
+    auto spann = std::dynamic_pointer_cast<SPTAG::SPANN::Index<T>>(index);
     if (spann == nullptr || spann->GetDiskIndex() == nullptr) return true;
 
     auto disk_index = spann->GetDiskIndex();
@@ -152,17 +180,47 @@ bool ensure_posting_mask_sidecar(
         && disk_index->LoadPostingMaskSidecar(index_dir);
 }
 
-bool load_or_build_posting_mask_sidecar(
+bool ensure_posting_mask_sidecar(
+    const std::shared_ptr<SPTAG::VectorIndex>& index,
+    const std::string& index_dir,
+    bool rebuild)
+{
+    switch (index->GetVectorValueType()) {
+    case SPTAG::VectorValueType::Float:
+        return ensure_posting_mask_sidecar_typed<float>(index, index_dir, rebuild);
+    case SPTAG::VectorValueType::Int8:
+        return ensure_posting_mask_sidecar_typed<std::int8_t>(index, index_dir, rebuild);
+    default:
+        return false;
+    }
+}
+
+template <typename T>
+bool load_or_build_posting_mask_sidecar_typed(
     const std::shared_ptr<SPTAG::VectorIndex>& index,
     const std::string& index_dir)
 {
-    auto spann = std::dynamic_pointer_cast<SPTAG::SPANN::Index<float>>(index);
+    auto spann = std::dynamic_pointer_cast<SPTAG::SPANN::Index<T>>(index);
     if (spann == nullptr || spann->GetDiskIndex() == nullptr) return true;
 
     auto disk_index = spann->GetDiskIndex();
     if (disk_index->LoadPostingMaskSidecar(index_dir)) return true;
     return disk_index->BuildPostingMaskSidecar(index_dir)
         && disk_index->LoadPostingMaskSidecar(index_dir);
+}
+
+bool load_or_build_posting_mask_sidecar(
+    const std::shared_ptr<SPTAG::VectorIndex>& index,
+    const std::string& index_dir)
+{
+    switch (index->GetVectorValueType()) {
+    case SPTAG::VectorValueType::Float:
+        return load_or_build_posting_mask_sidecar_typed<float>(index, index_dir);
+    case SPTAG::VectorValueType::Int8:
+        return load_or_build_posting_mask_sidecar_typed<std::int8_t>(index, index_dir);
+    default:
+        return false;
+    }
 }
 
 bool write_loader_config(
@@ -177,12 +235,33 @@ bool write_loader_config(
         || !config_file->Initialize(loader_path.c_str(), std::ios::out)) {
         return false;
     }
-    return index->SaveConfig(config_file) == SPTAG::ErrorCode::Success;
+    if (index->SaveConfig(config_file) != SPTAG::ErrorCode::Success) {
+        return false;
+    }
+    config_file.reset();
+
+    std::ifstream saved(loader_path, std::ios::binary);
+    if (!saved.is_open()) return false;
+    const std::string contents(
+        (std::istreambuf_iterator<char>(saved)),
+        std::istreambuf_iterator<char>());
+    saved.close();
+
+    std::ofstream loader(loader_path, std::ios::binary | std::ios::trunc);
+    if (!loader.is_open()) return false;
+    loader << "[Index]\n"
+           << "IndexAlgoType=SPANN\n"
+           << "ValueType="
+           << (index->GetVectorValueType() == SPTAG::VectorValueType::Int8 ? "Int8" : "Float")
+           << "\n\n"
+           << contents;
+    loader.flush();
+    return loader.good();
 }
 
 tpsql_spfresh_status build_spann(
     tpsql_spfresh_index* handle,
-    const float* vectors,
+    const void* vectors,
     uint32_t vector_count,
     bool rebuild_ssd_only)
 {
@@ -216,7 +295,7 @@ tpsql_spfresh_status build_spann(
 
         auto index = SPTAG::VectorIndex::CreateInstance(
             SPTAG::IndexAlgoType::SPANN,
-            SPTAG::VectorValueType::Float);
+            native_value_type(handle->value_type));
         if (index == nullptr) {
             return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to create SPFresh index");
         }
@@ -307,7 +386,7 @@ tpsql_spfresh_status build_spann_from_files(
 
         auto index = SPTAG::VectorIndex::CreateInstance(
             SPTAG::IndexAlgoType::SPANN,
-            SPTAG::VectorValueType::Float);
+            native_value_type(handle->value_type));
         if (index == nullptr) {
             return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "failed to create SPFresh index");
         }
@@ -356,10 +435,26 @@ tpsql_spfresh_status build_spann_from_files(
     }
 }
 
+template <typename T>
+SPTAG::ErrorCode search_spann(
+    const std::shared_ptr<SPTAG::VectorIndex>& index,
+    SPTAG::QueryResult& result,
+    const uint64_t* filter_bits,
+    size_t filter_word_count)
+{
+    auto spann = std::dynamic_pointer_cast<SPTAG::SPANN::Index<T>>(index);
+    if (spann == nullptr) return SPTAG::ErrorCode::Undefined;
+    if (filter_bits == nullptr || filter_word_count == 0) {
+        return spann->SearchIndex(result);
+    }
+    return spann->SearchIndex(result, filter_bits, filter_word_count);
+}
+
 } // namespace
 
 extern "C" tpsql_spfresh_index* tpsql_spfresh_create(
     uint32_t dimension,
+    tpsql_spfresh_value_type value_type,
     const char* index_dir,
     uint32_t build_threads,
     uint32_t ssd_batches,
@@ -368,6 +463,7 @@ extern "C" tpsql_spfresh_index* tpsql_spfresh_create(
     int load_all_vectors)
 {
     if (dimension == 0
+        || native_value_type(value_type) == SPTAG::VectorValueType::Undefined
         || index_dir == nullptr
         || index_dir[0] == '\0'
         || build_threads == 0
@@ -379,6 +475,7 @@ extern "C" tpsql_spfresh_index* tpsql_spfresh_create(
     try {
         auto* handle = new tpsql_spfresh_index();
         handle->dimension = dimension;
+        handle->value_type = value_type;
         handle->build_threads = build_threads;
         handle->ssd_batches = ssd_batches;
         handle->head_vector_count = head_vector_count;
@@ -401,7 +498,7 @@ extern "C" void tpsql_spfresh_destroy(tpsql_spfresh_index* index)
 
 extern "C" tpsql_spfresh_status tpsql_spfresh_build(
     tpsql_spfresh_index* handle,
-    const float* vectors,
+    const void* vectors,
     uint32_t vector_count)
 {
     return build_spann(handle, vectors, vector_count, false);
@@ -409,7 +506,7 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_build(
 
 extern "C" tpsql_spfresh_status tpsql_spfresh_rebuild_ssd(
     tpsql_spfresh_index* handle,
-    const float* vectors,
+    const void* vectors,
     uint32_t vector_count)
 {
     return build_spann(handle, vectors, vector_count, true);
@@ -473,6 +570,13 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_load_existing(tpsql_spfresh_index*
                 TPSQL_SPFRESH_BUILD_FAILED,
                 "SPFresh LoadIndex failed with error code " + std::to_string(static_cast<int>(status)));
         }
+        if (index->GetVectorValueType() != native_value_type(handle->value_type)) {
+            return set_error(
+                handle,
+                TPSQL_SPFRESH_BUILD_FAILED,
+                "SPFresh loaded value type does not match configured "
+                    + std::string(value_type_name(handle->value_type)));
+        }
         if (!configure_runtime_search_spann(index, handle->search_internal_result_num)) {
             return set_error(
                 handle,
@@ -520,7 +624,7 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_ensure_posting_mask_sidecar(tpsql_
 
 extern "C" tpsql_spfresh_status tpsql_spfresh_search(
     tpsql_spfresh_index* handle,
-    const float* query,
+    const void* query,
     uint32_t top_k,
     const uint64_t* filter_bits,
     size_t filter_word_count,
@@ -545,14 +649,15 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_search(
     try {
         SPTAG::QueryResult result(query, result_count, false);
         SPTAG::ErrorCode status = SPTAG::ErrorCode::Undefined;
-        auto spann = std::dynamic_pointer_cast<SPTAG::SPANN::Index<float>>(handle->index);
-        if (spann == nullptr) {
-            return set_error(handle, TPSQL_SPFRESH_SEARCH_FAILED, "SPFresh index has unexpected runtime type");
-        }
-        if (filter_bits == nullptr || filter_word_count == 0) {
-            status = spann->SearchIndex(result);
-        } else {
-            status = spann->SearchIndex(result, filter_bits, filter_word_count);
+        switch (handle->value_type) {
+        case TPSQL_SPFRESH_FLOAT32:
+            status = search_spann<float>(
+                handle->index, result, filter_bits, filter_word_count);
+            break;
+        case TPSQL_SPFRESH_INT8:
+            status = search_spann<std::int8_t>(
+                handle->index, result, filter_bits, filter_word_count);
+            break;
         }
         if (status != SPTAG::ErrorCode::Success) {
             return set_error(

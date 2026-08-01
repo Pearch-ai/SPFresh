@@ -22,8 +22,14 @@ typedef enum tpsql_spfresh_status {
     TPSQL_SPFRESH_EXCEPTION = 4
 } tpsql_spfresh_status;
 
+typedef enum tpsql_spfresh_value_type {
+    TPSQL_SPFRESH_FLOAT32 = 0,
+    TPSQL_SPFRESH_INT8 = 1
+} tpsql_spfresh_value_type;
+
 tpsql_spfresh_index* tpsql_spfresh_create(
     uint32_t dimension,
+    tpsql_spfresh_value_type value_type,
     const char* index_dir,
     uint32_t build_threads,
     uint32_t ssd_batches,
@@ -34,12 +40,12 @@ void tpsql_spfresh_destroy(tpsql_spfresh_index* index);
 
 tpsql_spfresh_status tpsql_spfresh_build(
     tpsql_spfresh_index* index,
-    const float* vectors,
+    const void* vectors,
     uint32_t vector_count);
 
 tpsql_spfresh_status tpsql_spfresh_rebuild_ssd(
     tpsql_spfresh_index* index,
-    const float* vectors,
+    const void* vectors,
     uint32_t vector_count);
 
 tpsql_spfresh_status tpsql_spfresh_build_from_files(
@@ -58,7 +64,7 @@ tpsql_spfresh_status tpsql_spfresh_ensure_posting_mask_sidecar(tpsql_spfresh_ind
 
 tpsql_spfresh_status tpsql_spfresh_search(
     tpsql_spfresh_index* index,
-    const float* query,
+    const void* query,
     uint32_t top_k,
     const uint64_t* filter_bits,
     size_t filter_word_count,
