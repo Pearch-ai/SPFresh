@@ -27,9 +27,15 @@ typedef enum tpsql_spfresh_value_type {
     TPSQL_SPFRESH_INT8 = 1
 } tpsql_spfresh_value_type;
 
+typedef enum tpsql_spfresh_distance {
+    TPSQL_SPFRESH_L2 = 0,
+    TPSQL_SPFRESH_DOT_PRODUCT = 1
+} tpsql_spfresh_distance;
+
 tpsql_spfresh_index* tpsql_spfresh_create(
     uint32_t dimension,
     tpsql_spfresh_value_type value_type,
+    tpsql_spfresh_distance distance,
     const char* index_dir,
     uint32_t build_threads,
     uint32_t ssd_batches,

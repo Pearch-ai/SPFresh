@@ -19,6 +19,7 @@
 struct tpsql_spfresh_index {
     uint32_t dimension;
     tpsql_spfresh_value_type value_type;
+    tpsql_spfresh_distance distance;
     uint32_t build_threads;
     uint32_t ssd_batches;
     uint32_t head_vector_count;
@@ -53,6 +54,28 @@ const char* value_type_name(tpsql_spfresh_value_type value_type)
     return "Undefined";
 }
 
+SPTAG::DistCalcMethod native_distance(tpsql_spfresh_distance distance)
+{
+    switch (distance) {
+    case TPSQL_SPFRESH_L2:
+        return SPTAG::DistCalcMethod::L2;
+    case TPSQL_SPFRESH_DOT_PRODUCT:
+        return SPTAG::DistCalcMethod::InnerProduct;
+    }
+    return SPTAG::DistCalcMethod::Undefined;
+}
+
+const char* distance_name(tpsql_spfresh_distance distance)
+{
+    switch (distance) {
+    case TPSQL_SPFRESH_L2:
+        return "L2";
+    case TPSQL_SPFRESH_DOT_PRODUCT:
+        return "InnerProduct";
+    }
+    return "Undefined";
+}
+
 tpsql_spfresh_status set_error(
     tpsql_spfresh_index* handle,
     tpsql_spfresh_status status,
@@ -77,6 +100,7 @@ bool configure_spann(
     const std::shared_ptr<SPTAG::VectorIndex>& index,
     const std::string& index_dir,
     uint32_t dimension,
+    tpsql_spfresh_distance distance,
     uint32_t build_threads,
     bool rebuild_ssd_only,
     const char* vector_paths,
@@ -104,7 +128,7 @@ bool configure_spann(
     const char* value_type_value = value_type == SPTAG::VectorValueType::Int8 ? "Int8" : "Float";
     return set_parameter(index, "IndexAlgoType", "BKT", "Base")
         && set_parameter(index, "ValueType", value_type_value, "Base")
-        && set_parameter(index, "DistCalcMethod", "L2", "Base")
+        && set_parameter(index, "DistCalcMethod", distance_name(distance), "Base")
         && set_parameter(index, "Dim", dimension_value.c_str(), "Base")
         && set_parameter(index, "VectorPath", vector_paths == nullptr ? "" : vector_paths, "Base")
         && set_parameter(index, "VectorType", "DEFAULT", "Base")
@@ -303,6 +327,7 @@ tpsql_spfresh_status build_spann(
                 index,
                 handle->index_dir,
                 handle->dimension,
+                handle->distance,
                 handle->build_threads,
                 rebuild_ssd_only,
                 nullptr,
@@ -394,6 +419,7 @@ tpsql_spfresh_status build_spann_from_files(
                 index,
                 handle->index_dir,
                 handle->dimension,
+                handle->distance,
                 handle->build_threads,
                 rebuild_ssd_only,
                 vector_paths,
@@ -455,6 +481,7 @@ SPTAG::ErrorCode search_spann(
 extern "C" tpsql_spfresh_index* tpsql_spfresh_create(
     uint32_t dimension,
     tpsql_spfresh_value_type value_type,
+    tpsql_spfresh_distance distance,
     const char* index_dir,
     uint32_t build_threads,
     uint32_t ssd_batches,
@@ -464,6 +491,7 @@ extern "C" tpsql_spfresh_index* tpsql_spfresh_create(
 {
     if (dimension == 0
         || native_value_type(value_type) == SPTAG::VectorValueType::Undefined
+        || native_distance(distance) == SPTAG::DistCalcMethod::Undefined
         || index_dir == nullptr
         || index_dir[0] == '\0'
         || build_threads == 0
@@ -476,6 +504,7 @@ extern "C" tpsql_spfresh_index* tpsql_spfresh_create(
         auto* handle = new tpsql_spfresh_index();
         handle->dimension = dimension;
         handle->value_type = value_type;
+        handle->distance = distance;
         handle->build_threads = build_threads;
         handle->ssd_batches = ssd_batches;
         handle->head_vector_count = head_vector_count;
@@ -576,6 +605,13 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_load_existing(tpsql_spfresh_index*
                 TPSQL_SPFRESH_BUILD_FAILED,
                 "SPFresh loaded value type does not match configured "
                     + std::string(value_type_name(handle->value_type)));
+        }
+        if (index->GetDistCalcMethod() != native_distance(handle->distance)) {
+            return set_error(
+                handle,
+                TPSQL_SPFRESH_BUILD_FAILED,
+                "SPFresh loaded distance does not match configured "
+                    + std::string(distance_name(handle->distance)));
         }
         if (!configure_runtime_search_spann(index, handle->search_internal_result_num)) {
             return set_error(
