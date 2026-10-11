@@ -118,7 +118,8 @@ namespace SPTAG
             if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) continue; \
             (this->*m_parseEncoding)(p_index, listInfo, (ValueType*)(p_postingListFullData + offsetVector));\
             auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), p_postingListFullData + offsetVector); \
-            queryResults.AddPoint(vectorID, distance2leaf); \
+            auto referenceDistance = queryResults.GetReferenceTarget() == nullptr ? MaxDist : p_index->ComputeDistance(queryResults.GetReferenceTarget(), p_postingListFullData + offsetVector); \
+            queryResults.AddPoint(vectorID, distance2leaf, referenceDistance); \
         } \
 
 #define ProcessPostingPartial(loadedPageMask) \
@@ -134,7 +135,8 @@ namespace SPTAG
             if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) continue; \
             (this->*m_parseEncoding)(p_index, listInfo, (ValueType*)(p_postingListFullData + offsetVector));\
             auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), p_postingListFullData + offsetVector); \
-            queryResults.AddPoint(vectorID, distance2leaf); \
+            auto referenceDistance = queryResults.GetReferenceTarget() == nullptr ? MaxDist : p_index->ComputeDistance(queryResults.GetReferenceTarget(), p_postingListFullData + offsetVector); \
+            queryResults.AddPoint(vectorID, distance2leaf, referenceDistance); \
         } \
 
         template <typename ValueType>

@@ -48,6 +48,7 @@ public:
     QueryResult(const QueryResult& p_other)
     {
         Init(p_other.m_target, p_other.m_resultNum, p_other.m_withMeta);
+        m_referenceTarget = p_other.m_referenceTarget;
         if (m_resultNum > 0)
         {
             std::copy(p_other.m_results.Data(), p_other.m_results.Data() + m_resultNum, m_results.Data());
@@ -66,6 +67,7 @@ public:
         if (m_target != m_quantizedTarget) ALIGN_FREE(m_quantizedTarget);
 
         Init(p_other.m_target, p_other.m_resultNum, p_other.m_withMeta);
+        m_referenceTarget = p_other.m_referenceTarget;
         if (m_resultNum > 0)
         {
             std::copy(p_other.m_results.Data(), p_other.m_results.Data() + m_resultNum, m_results.Data());
@@ -91,6 +93,7 @@ public:
 
     inline void Init(const void* p_target, int p_resultNum, bool p_withMeta)
     {
+        m_referenceTarget = nullptr;
         m_target = p_target;
         m_resultNum = p_resultNum;
         m_withMeta = p_withMeta;
@@ -104,6 +107,16 @@ public:
     inline int GetResultNum() const
     {
         return m_resultNum;
+    }
+
+    inline void SetReferenceTarget(const void* p_target)
+    {
+        m_referenceTarget = p_target;
+    }
+
+    inline const void* GetReferenceTarget() const
+    {
+        return m_referenceTarget;
     }
 
 
@@ -200,6 +213,7 @@ public:
         {
             m_results[i].VID = -1;
             m_results[i].Dist = MaxDist;
+            m_results[i].ReferenceDist = MaxDist;
             m_results[i].Meta.Clear();
         }
     }
@@ -230,6 +244,7 @@ public:
 
 
 protected:
+    const void* m_referenceTarget = nullptr;
     const void* m_target;
 
     void* m_quantizedTarget;

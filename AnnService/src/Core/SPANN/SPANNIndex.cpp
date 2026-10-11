@@ -416,6 +416,14 @@ namespace SPTAG
                 p_queryResults = new COMMON::QueryResultSet<T>((const T*)p_query.GetTarget(), m_options.m_searchInternalResultNum);
 
             m_index->SearchIndex(*p_queryResults);
+            p_queryResults->SetReferenceTarget(p_query.GetReferenceTarget());
+            if (p_query.GetReferenceTarget() != nullptr) {
+                for (int i = 0; i < p_queryResults->GetResultNum(); ++i) {
+                    auto res = p_queryResults->GetResult(i);
+                    if (res->VID < 0 || res->Dist >= MaxDist) continue;
+                    res->ReferenceDist = m_index->ComputeDistance(p_query.GetReferenceTarget(), m_index->GetSample(res->VID));
+                }
+            }
 
             if (m_extraSearcher != nullptr) {
                 if (m_workspace.get() == nullptr) {

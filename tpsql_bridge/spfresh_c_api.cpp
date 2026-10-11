@@ -661,6 +661,7 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_ensure_posting_mask_sidecar(tpsql_
 extern "C" tpsql_spfresh_status tpsql_spfresh_search(
     tpsql_spfresh_index* handle,
     const void* query,
+    const void* reference_query,
     uint32_t top_k,
     const uint64_t* filter_bits,
     size_t filter_word_count,
@@ -684,6 +685,7 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_search(
     int result_count = static_cast<int>(std::min(top_k, capacity));
     try {
         SPTAG::QueryResult result(query, result_count, false);
+        result.SetReferenceTarget(reference_query);
         SPTAG::ErrorCode status = SPTAG::ErrorCode::Undefined;
         switch (handle->value_type) {
         case TPSQL_SPFRESH_FLOAT32:
@@ -710,6 +712,7 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_search(
             hits[*in_out_hit_count] = tpsql_spfresh_hit {
                 static_cast<uint32_t>(item->VID),
                 item->Dist,
+                item->ReferenceDist,
             };
             *in_out_hit_count += 1;
         }

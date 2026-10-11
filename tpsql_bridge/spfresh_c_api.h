@@ -12,6 +12,7 @@ typedef struct tpsql_spfresh_index tpsql_spfresh_index;
 typedef struct tpsql_spfresh_hit {
     uint32_t vector_id;
     float distance;
+    float reference_distance;
 } tpsql_spfresh_hit;
 
 typedef enum tpsql_spfresh_status {
@@ -71,6 +72,7 @@ tpsql_spfresh_status tpsql_spfresh_ensure_posting_mask_sidecar(tpsql_spfresh_ind
 tpsql_spfresh_status tpsql_spfresh_search(
     tpsql_spfresh_index* index,
     const void* query,
+    const void* reference_query,
     uint32_t top_k,
     const uint64_t* filter_bits,
     size_t filter_word_count,

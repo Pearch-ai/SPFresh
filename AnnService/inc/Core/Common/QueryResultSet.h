@@ -74,12 +74,13 @@ public:
         return m_results[0].Dist;
     }
 
-    bool AddPoint(const SizeType index, float dist)
+    bool AddPoint(const SizeType index, float dist, float referenceDist = MaxDist)
     {
         if (dist < m_results[0].Dist || (dist == m_results[0].Dist && index < m_results[0].VID))
         {
             m_results[0].VID = index;
             m_results[0].Dist = dist;
+            m_results[0].ReferenceDist = referenceDist;
             Heapify(m_resultNum);
             return true;
         }

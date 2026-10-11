@@ -66,6 +66,7 @@ namespace SPTAG
     {
         SizeType VID;
         float Dist;
+        float ReferenceDist = MaxDist;
         ByteArray Meta;
 
         BasicResult() : VID(-1), Dist(MaxDist) {}

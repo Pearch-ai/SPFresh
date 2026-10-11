@@ -1229,7 +1229,8 @@ namespace SPTAG::SPANN {
                         continue;
                     }
                     auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), vectorInfo + m_metaDataSize);
-                    queryResults.AddPoint(vectorID, distance2leaf);
+                    auto referenceDistance = queryResults.GetReferenceTarget() == nullptr ? MaxDist : p_index->ComputeDistance(queryResults.GetReferenceTarget(), vectorInfo + m_metaDataSize);
+                    queryResults.AddPoint(vectorID, distance2leaf, referenceDistance);
                 }
                 auto compEnd = std::chrono::high_resolution_clock::now();
                 if (realNum <= m_mergeThreshold && !m_opt->m_inPlace) MergeAsync(p_index.get(), curPostingID);
