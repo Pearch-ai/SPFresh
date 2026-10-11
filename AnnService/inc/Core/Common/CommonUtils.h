@@ -32,19 +32,21 @@ namespace SPTAG
 
             static inline float atomic_float_add(volatile float* ptr, const float operand)
             {
+                using FloatBits = std::conditional_t<sizeof(long) == sizeof(float), long, std::int32_t>;
+                static_assert(sizeof(FloatBits) == sizeof(float));
                 union {
-                    volatile long iOld;
+                    volatile FloatBits iOld;
                     float fOld;
                 };
                 union {
-                    long iNew;
+                    FloatBits iNew;
                     float fNew;
                 };
 
                 while (true) {
-                    iOld = *(volatile long *)ptr;
+                    iOld = *(volatile FloatBits *)ptr;
                     fNew = fOld + operand;
-                    if (InterlockedCompareExchange((long *)ptr, iNew, iOld) == iOld) {
+                    if (InterlockedCompareExchange((FloatBits *)ptr, iNew, iOld) == iOld) {
                         return fNew;
                     }
                 }

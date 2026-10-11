@@ -904,17 +904,17 @@ namespace SPTAG
                 offsets.push_back(0);
 
                 LOG(Helper::LogLevel::LL_Info, "Building posting mask sidecar start lists=%zu path=%s\n", totalLists, path.c_str());
-                std::vector<char> buffer;
+                PageBuffer<char> buffer;
                 for (size_t postingID = 0; postingID < m_listInfos.size(); ++postingID)
                 {
                     const ListInfo* listInfo = &(m_listInfos[postingID]);
                     const size_t totalBytes = (static_cast<size_t>(listInfo->listPageCount) << PageSizeEx);
                     if (listInfo->listEleCount > 0 && totalBytes > 0)
                     {
-                        buffer.resize(totalBytes);
+                        buffer.ReservePageBuffer(totalBytes);
                         const int fileid = m_oneContext ? 0 : static_cast<int>(postingID) / m_listPerFile;
                         Helper::DiskIO* indexFile = m_indexFiles[fileid].get();
-                        auto numRead = indexFile->ReadBinary(totalBytes, buffer.data(), listInfo->listOffset);
+                        auto numRead = indexFile->ReadBinary(totalBytes, buffer.GetBuffer(), listInfo->listOffset);
                         if (numRead != totalBytes) {
                             LOG(Helper::LogLevel::LL_Error, "Failed to build posting mask sidecar: file %s read bytes, expected: %zu, actual: %llu.\n", m_extraFullGraphFile.c_str(), totalBytes, numRead);
                             return false;
@@ -922,7 +922,7 @@ namespace SPTAG
                         pagesRead += static_cast<std::uint64_t>(listInfo->listPageCount);
                         bytesRead += static_cast<std::uint64_t>(totalBytes);
 
-                        char* p_postingListFullData = buffer.data() + listInfo->pageOffset;
+                        char* p_postingListFullData = buffer.GetBuffer() + listInfo->pageOffset;
                         for (int i = 0; i < listInfo->listEleCount; ++i)
                         {
                             std::uint64_t offsetVectorID = 0;
