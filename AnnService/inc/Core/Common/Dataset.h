@@ -224,7 +224,7 @@ namespace SPTAG
             SizeType maxRows;
             SizeType rowsInBlock;
             SizeType rowsInBlockEx;
-            std::shared_ptr<std::vector<char*>> incBlocks;
+            std::shared_ptr<std::vector<char*>> incBlocks = std::make_shared<std::vector<char*>>();
 
             DimensionType colStart = 0;
             DimensionType mycols = 0;
