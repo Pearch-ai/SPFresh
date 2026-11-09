@@ -1284,6 +1284,7 @@ namespace SPTAG
                 std::max<int>(2, m_options.m_postingPageLimit * PageSize / (sizeof(T) * m_options.m_dim + sizeof(int) + 1)),
                 false, m_options.m_latencyLimit, m_options.m_mergeThreshold, false, 64, 3, memoryBytes);
             mutableIndex->InitializeMutable(m_options, m_versionMap, m_index);
+            mutableIndex->BeginBulkLoad();
             const auto plainRecordBytes = sizeof(int) + sizeof(T) * m_options.m_dim;
             for (SizeType postingId = 0; postingId < heads; ++postingId) {
                 std::string original;
@@ -1307,6 +1308,7 @@ namespace SPTAG
                 }
                 mutableIndex->GetWritePosting(postingId, posting, true);
             }
+            mutableIndex->FinishBulkLoad();
             m_vectorTranslateMap.reset();
             m_extraSearcher = std::move(mutableIndex);
             m_bReady = true;

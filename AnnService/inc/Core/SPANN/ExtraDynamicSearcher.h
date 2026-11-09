@@ -1618,6 +1618,22 @@ namespace SPTAG::SPANN {
             }
         }
 
+        void BeginBulkLoad() {
+#ifdef ROCKSDB
+            dynamic_cast<RocksDBIO&>(*db).BeginBulkLoad();
+#else
+            throw std::runtime_error("SPFresh mutable storage requires RocksDB");
+#endif
+        }
+
+        void FinishBulkLoad() {
+#ifdef ROCKSDB
+            dynamic_cast<RocksDBIO&>(*db).FinishBulkLoad();
+#else
+            throw std::runtime_error("SPFresh mutable storage requires RocksDB");
+#endif
+        }
+
         bool MaintainOne() {
             if (!m_opt->m_synchronousUpdates) throw std::runtime_error("SPFresh synchronous maintenance is disabled");
             return m_reassignThreadPool->runOne() || m_splitThreadPool->runOne();

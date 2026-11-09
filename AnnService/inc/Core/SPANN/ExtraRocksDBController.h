@@ -147,6 +147,33 @@ namespace SPTAG::SPANN
             }
         }
 
+        void BeginBulkLoad() {
+            auto status = db->SetOptions({
+                {"disable_auto_compactions", "true"},
+                {"enable_blob_garbage_collection", "false"},
+                {"level0_slowdown_writes_trigger", std::to_string(INT_MAX - 1)},
+                {"level0_stop_writes_trigger", std::to_string(INT_MAX)},
+            });
+            if (!status.ok()) throw std::runtime_error("SPFresh bulk import setup failed: " + status.ToString());
+        }
+
+        void FinishBulkLoad() {
+            rocksdb::FlushOptions flush;
+            flush.wait = true;
+            auto status = db->Flush(flush);
+            if (!status.ok()) throw std::runtime_error("SPFresh bulk import flush failed: " + status.ToString());
+            status = db->CompactRange(rocksdb::CompactRangeOptions(), nullptr, nullptr);
+            if (!status.ok()) throw std::runtime_error("SPFresh bulk import compaction failed: " + status.ToString());
+            status = db->SetOptions({
+                {"enable_blob_garbage_collection", dbOptions.enable_blob_garbage_collection ? "true" : "false"},
+                {"level0_slowdown_writes_trigger", std::to_string(dbOptions.level0_slowdown_writes_trigger)},
+                {"level0_stop_writes_trigger", std::to_string(dbOptions.level0_stop_writes_trigger)},
+            });
+            if (!status.ok()) throw std::runtime_error("SPFresh bulk import option restore failed: " + status.ToString());
+            status = db->EnableAutoCompaction({db->DefaultColumnFamily()});
+            if (!status.ok()) throw std::runtime_error("SPFresh bulk import compaction restore failed: " + status.ToString());
+        }
+
         void Checkpoint(const std::string& path) {
             auto status = db->FlushWAL(true);
             if (!status.ok()) throw std::runtime_error(status.ToString());
