@@ -79,6 +79,13 @@ tpsql_spfresh_status tpsql_spfresh_search(
     tpsql_spfresh_hit* hits,
     uint32_t* in_out_hit_count);
 
+tpsql_spfresh_status tpsql_spfresh_enable_mutable(tpsql_spfresh_index* index, const char* directory, uint32_t vector_count, uint64_t memory_bytes);
+tpsql_spfresh_status tpsql_spfresh_append_mutable(tpsql_spfresh_index* index, const void* vector, uint32_t vector_id);
+tpsql_spfresh_status tpsql_spfresh_maintain_mutable(tpsql_spfresh_index* index, int* did_work);
+tpsql_spfresh_status tpsql_spfresh_checkpoint_mutable_config(tpsql_spfresh_index* index, const char* directory);
+tpsql_spfresh_status tpsql_spfresh_checkpoint_mutable(tpsql_spfresh_index* index, const char* directory);
+tpsql_spfresh_status tpsql_spfresh_delete_mutable(tpsql_spfresh_index* index, uint32_t vector_id);
+
 const char* tpsql_spfresh_last_error(const tpsql_spfresh_index* index);
 
 #ifdef __cplusplus

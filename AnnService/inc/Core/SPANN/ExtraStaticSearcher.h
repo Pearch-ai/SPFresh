@@ -1832,7 +1832,7 @@ namespace SPTAG
                     throw std::runtime_error("File read mismatch");
                 }
                 char* ptr = (char*)(posting.c_str());
-                memcpy(ptr, posting.c_str() + listInfo->pageOffset, realBytes);
+                memmove(ptr, posting.c_str() + listInfo->pageOffset, realBytes);
                 posting.resize(realBytes);
             }
 

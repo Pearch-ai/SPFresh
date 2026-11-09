@@ -124,6 +124,21 @@ namespace SPTAG
             return ret;
         }
 
+        template<typename T>
+        ErrorCode Index<T>::SaveReadOnlyCheckpoint(const std::vector<std::shared_ptr<Helper::DiskIO>>& streams)
+        {
+            if (streams.size() < 4) return ErrorCode::LackOfInputs;
+            std::lock_guard<std::mutex> addLock(m_dataAddLock);
+            std::shared_lock<std::shared_timed_mutex> deleteLock(m_dataDeleteLock);
+            auto status = m_pSamples.Save(streams[0]);
+            if (status != ErrorCode::Success) return status;
+            status = m_pTrees.SaveTrees(streams[1]);
+            if (status != ErrorCode::Success) return status;
+            status = m_pGraph.SaveGraph(streams[2]);
+            if (status != ErrorCode::Success) return status;
+            return m_deletedID.Save(streams[3]);
+        }
+
 #pragma region K-NN search
 /*
 #define Search(CheckDeleted, CheckDuplicated) \

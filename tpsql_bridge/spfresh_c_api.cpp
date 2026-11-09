@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -27,10 +28,12 @@ struct tpsql_spfresh_index {
     bool load_all_vectors;
     std::string index_dir;
     std::shared_ptr<SPTAG::VectorIndex> index;
-    std::string last_error;
+    bool mutable_storage = false;
 };
 
 namespace {
+
+thread_local std::string bridge_error;
 
 SPTAG::VectorValueType native_value_type(tpsql_spfresh_value_type value_type)
 {
@@ -82,7 +85,7 @@ tpsql_spfresh_status set_error(
     const std::string& message)
 {
     if (handle != nullptr) {
-        handle->last_error = message;
+        bridge_error = message;
     }
     return status;
 }
@@ -173,6 +176,7 @@ bool ensure_posting_mask_sidecar_typed(
     auto spann = std::dynamic_pointer_cast<SPTAG::SPANN::Index<T>>(index);
     if (spann == nullptr || spann->GetDiskIndex() == nullptr) return true;
 
+    if (spann->GetOptions()->m_useKV) return true;
     auto disk_index = spann->GetDiskIndex();
     if (rebuild) {
         return disk_index->BuildPostingMaskSidecar(index_dir)
@@ -365,7 +369,7 @@ tpsql_spfresh_status build_spann(
         }
 
         handle->index = std::move(index);
-        handle->last_error.clear();
+        bridge_error.clear();
         return TPSQL_SPFRESH_OK;
     } catch (const std::exception& error) {
         return set_error(handle, TPSQL_SPFRESH_EXCEPTION, error.what());
@@ -452,7 +456,7 @@ tpsql_spfresh_status build_spann_from_files(
         }
 
         handle->index = std::move(index);
-        handle->last_error.clear();
+        bridge_error.clear();
         return TPSQL_SPFRESH_OK;
     } catch (const std::exception& error) {
         return set_error(handle, TPSQL_SPFRESH_EXCEPTION, error.what());
@@ -519,6 +523,7 @@ extern "C" tpsql_spfresh_index* tpsql_spfresh_create(
 
 extern "C" void tpsql_spfresh_destroy(tpsql_spfresh_index* index)
 {
+    if (index && index->mutable_storage) { delete index; return; }
     // SPANN indexes built through the in-memory API currently crash during
     // native teardown in this embedding. Keep process stability for the first
     // integration; rebuild lifecycle should be revisited before production use.
@@ -626,8 +631,15 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_load_existing(tpsql_spfresh_index*
                 "SPFresh posting mask sidecar is required but missing, stale, or unreadable; run sidecar build on a writable indexer before starting search");
         }
         handle->dimension = static_cast<uint32_t>(index->GetFeatureDim());
+        if (handle->value_type == TPSQL_SPFRESH_INT8) {
+            auto options = std::dynamic_pointer_cast<SPTAG::SPANN::Index<int8_t>>(index)->GetOptions();
+            handle->mutable_storage = options->m_useKV && options->m_synchronousUpdates;
+        } else {
+            auto options = std::dynamic_pointer_cast<SPTAG::SPANN::Index<float>>(index)->GetOptions();
+            handle->mutable_storage = options->m_useKV && options->m_synchronousUpdates;
+        }
         handle->index = std::move(index);
-        handle->last_error.clear();
+        bridge_error.clear();
         return TPSQL_SPFRESH_OK;
     } catch (const std::exception& error) {
         return set_error(handle, TPSQL_SPFRESH_EXCEPTION, error.what());
@@ -649,7 +661,7 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_ensure_posting_mask_sidecar(tpsql_
                 TPSQL_SPFRESH_BUILD_FAILED,
                 "failed to load or build SPFresh posting mask sidecar");
         }
-        handle->last_error.clear();
+        bridge_error.clear();
         return TPSQL_SPFRESH_OK;
     } catch (const std::exception& error) {
         return set_error(handle, TPSQL_SPFRESH_EXCEPTION, error.what());
@@ -716,7 +728,7 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_search(
             };
             *in_out_hit_count += 1;
         }
-        handle->last_error.clear();
+        bridge_error.clear();
         return TPSQL_SPFRESH_OK;
     } catch (const std::exception& error) {
         return set_error(handle, TPSQL_SPFRESH_EXCEPTION, error.what());
@@ -730,5 +742,61 @@ extern "C" const char* tpsql_spfresh_last_error(const tpsql_spfresh_index* index
     if (index == nullptr) {
         return "null SPFresh index";
     }
-    return index->last_error.c_str();
+    return bridge_error.c_str();
+}
+
+namespace {
+template <typename Action>
+tpsql_spfresh_status mutable_action(tpsql_spfresh_index* handle, Action action)
+{
+    if (!handle || !handle->index) return TPSQL_SPFRESH_INVALID_ARGUMENT;
+    try {
+        SPTAG::ErrorCode status;
+        if (handle->value_type == TPSQL_SPFRESH_INT8)
+            status = action(std::dynamic_pointer_cast<SPTAG::SPANN::Index<int8_t>>(handle->index));
+        else
+            status = action(std::dynamic_pointer_cast<SPTAG::SPANN::Index<float>>(handle->index));
+        if (status != SPTAG::ErrorCode::Success) return set_error(handle, TPSQL_SPFRESH_BUILD_FAILED, "SPFresh mutable operation failed");
+        return TPSQL_SPFRESH_OK;
+    } catch (const std::exception& error) {
+        return set_error(handle, TPSQL_SPFRESH_EXCEPTION, error.what());
+    }
+}
+}
+
+extern "C" tpsql_spfresh_status tpsql_spfresh_enable_mutable(tpsql_spfresh_index* handle, const char* directory, uint32_t count, uint64_t memory_bytes)
+{
+    if (!directory || memory_bytes < (16UL << 20)) return TPSQL_SPFRESH_INVALID_ARGUMENT;
+    return mutable_action(handle, [&](auto index) {
+        auto status = index->EnableMutable(directory, count, memory_bytes);
+        if (status == SPTAG::ErrorCode::Success) handle->mutable_storage = true;
+        return status;
+    });
+}
+extern "C" tpsql_spfresh_status tpsql_spfresh_append_mutable(tpsql_spfresh_index* handle, const void* vector, uint32_t id)
+{
+    if (!vector || id >= static_cast<uint32_t>(INT_MAX)) return TPSQL_SPFRESH_INVALID_ARGUMENT;
+    return mutable_action(handle, [&](auto index) { return index->AppendMutable(vector, id); });
+}
+extern "C" tpsql_spfresh_status tpsql_spfresh_maintain_mutable(tpsql_spfresh_index* handle, int* did_work)
+{
+    if (!did_work) return TPSQL_SPFRESH_INVALID_ARGUMENT;
+    return mutable_action(handle, [&](auto index) { *did_work = index->MaintainMutable(); return SPTAG::ErrorCode::Success; });
+}
+extern "C" tpsql_spfresh_status tpsql_spfresh_checkpoint_mutable_config(tpsql_spfresh_index* handle, const char* directory)
+{
+    if (!directory) return TPSQL_SPFRESH_INVALID_ARGUMENT;
+    return mutable_action(handle, [&](auto index) { return index->CheckpointMutableConfig(directory); });
+}
+extern "C" tpsql_spfresh_status tpsql_spfresh_checkpoint_mutable(tpsql_spfresh_index* handle, const char* directory)
+{
+    if (!directory) return TPSQL_SPFRESH_INVALID_ARGUMENT;
+    return mutable_action(handle, [&](auto index) { return index->CheckpointMutable(directory); });
+}
+extern "C" tpsql_spfresh_status tpsql_spfresh_delete_mutable(tpsql_spfresh_index* handle, uint32_t id)
+{
+    return mutable_action(handle, [&](auto index) {
+        auto status = index->DeleteIndex(static_cast<int>(id));
+        return status == SPTAG::ErrorCode::VectorNotFound ? SPTAG::ErrorCode::Success : status;
+    });
 }

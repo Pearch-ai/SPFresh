@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "inc/Core/SPANN/Index.h"
+#include "inc/Core/BKT/Index.h"
 #include "inc/Core/Common/TpsqlMemoryLog.h"
 #include "inc/Helper/VectorSetReaders/MemoryReader.h"
 #include "inc/Core/SPANN/ExtraStaticSearcher.h"
@@ -9,6 +10,7 @@
 #include <shared_mutex>
 #include <chrono>
 #include <random>
+#include <filesystem>
 
 #pragma warning(disable:4242)  // '=' : conversion from 'int' to 'short', possible loss of data
 #pragma warning(disable:4244)  // '=' : conversion from 'int' to 'short', possible loss of data
@@ -101,10 +103,10 @@ namespace SPTAG
             {
                 if (m_options.m_useKV) {
                     if (m_options.m_inPlace) {
-                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold, false, 64, 3, m_options.m_liveMemoryBytes));
                     }
                     else {
-                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, m_options.m_postingPageLimit * PageSize / (sizeof(T) * m_options.m_dim + sizeof(int) + sizeof(uint8_t)), m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, m_options.m_postingPageLimit * PageSize / (sizeof(T) * m_options.m_dim + sizeof(int) + sizeof(uint8_t)), m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold, false, 64, 3, m_options.m_liveMemoryBytes));
                     }
                 }
                 else {
@@ -162,10 +164,10 @@ namespace SPTAG
             {
                 if (m_options.m_useKV) {
                     if (m_options.m_inPlace) {
-                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold, false, 64, 3, m_options.m_liveMemoryBytes));
                     }
                     else {
-                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, m_options.m_postingPageLimit * PageSize / (sizeof(T) * m_options.m_dim + sizeof(int) + sizeof(uint8_t)), m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, m_options.m_postingPageLimit * PageSize / (sizeof(T) * m_options.m_dim + sizeof(int) + sizeof(uint8_t)), m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold, false, 64, 3, m_options.m_liveMemoryBytes));
                     }
                 }
                 else if (m_options.m_useSPDK) {
@@ -990,10 +992,10 @@ namespace SPTAG
                 if (m_options.m_useKV)
                 {
                     if (m_options.m_inPlace) {
-                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold, false, 64, 3, m_options.m_liveMemoryBytes));
                     }
                     else {
-                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, m_options.m_postingPageLimit * PageSize / (sizeof(T)*m_options.m_dim + sizeof(int) + sizeof(uint8_t)), m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+                        m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, m_options.m_postingPageLimit * PageSize / (sizeof(T)*m_options.m_dim + sizeof(int) + sizeof(uint8_t)), m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold, false, 64, 3, m_options.m_liveMemoryBytes));
                     }
                 } else if (m_options.m_useSPDK)
                 {
@@ -1197,11 +1199,11 @@ namespace SPTAG
                 begin = m_versionMap.GetVectorNum();
                 end = begin + p_vectorNum;
 
-                if (begin == 0) { return ErrorCode::EmptyIndex; }
+                if (begin == 0 && !m_options.m_synchronousUpdates) { return ErrorCode::EmptyIndex; }
 
                 if (m_versionMap.AddBatch(p_vectorNum) != ErrorCode::Success) {
                     LOG(Helper::LogLevel::LL_Info, "MemoryOverFlow: VID: %d, Map Size:%d\n", begin, m_versionMap.BufferSize());
-                    exit(1);
+                    throw std::runtime_error("SPFresh vector metadata capacity exceeded");
                 }
 
                 if (m_pMetadata != nullptr) {
@@ -1237,6 +1239,133 @@ namespace SPTAG
             }
 
             return m_extraSearcher->AddIndex(vectorSet, m_index, begin);
+        }
+
+        template <typename T>
+        ErrorCode Index<T>::EnableMutable(const std::string& directory, SizeType vectorCount, std::uint64_t memoryBytes)
+        {
+            if (m_options.m_useKV || m_options.m_useSPDK || m_pQuantizer || !m_extraSearcher)
+                throw std::runtime_error("SPFresh conversion requires an unquantized static SSD index");
+            if (m_options.m_enableDataCompression || m_options.m_enableDeltaEncoding || m_options.m_enablePostingListRearrange)
+                throw std::runtime_error("SPFresh mutable conversion requires plain postings");
+            const auto heads = m_index->GetNumSamples();
+            if (static_cast<std::uint64_t>(vectorCount) + static_cast<std::uint64_t>(heads) * sizeof(int) + (2UL << 20) > memoryBytes / 2)
+                throw std::runtime_error("SPFresh live metadata exceeds the indexer RAM budget");
+            const auto headLimit = static_cast<int>(std::min<std::uint64_t>(MaxSize, heads + memoryBytes / 4 / (sizeof(T) * m_options.m_dim * 16 + 4096)));
+            const auto rows = std::max<std::uint64_t>(1, std::min<std::uint64_t>(4096, memoryBytes / 64 / (sizeof(T) * m_options.m_dim + 256)));
+            m_index->SetParameter("NumberOfThreads", "1");
+            m_index->SetParameter("DataBlockSize", std::to_string(rows));
+            m_index->SetParameter("DataCapacity", std::to_string(headLimit));
+            std::filesystem::create_directories(directory + "/seed");
+            if (m_index->SaveIndex(directory + "/seed") != ErrorCode::Success)
+                throw std::runtime_error("SPFresh mutable head preparation failed");
+            m_index.reset();
+            if (VectorIndex::LoadIndex(directory + "/seed", m_index) != ErrorCode::Success)
+                throw std::runtime_error("SPFresh mutable head reload failed");
+            m_index->SetParameter("NumberOfThreads", "1");
+            m_index->UpdateIndex();
+            m_options.m_indexDirectory = directory;
+            m_options.m_KVPath = directory + "/rocks";
+            m_options.m_deleteIDFile = directory + "/DeletedIDs.bin";
+            m_options.m_ssdInfoFile = directory + "/SSDInfo.bin";
+            m_options.m_datasetRowsInBlock = static_cast<int>(rows);
+            m_options.m_liveMemoryBytes = memoryBytes;
+            m_options.m_synchronousUpdates = true;
+            m_options.m_liveHeadLimit = headLimit;
+            m_options.m_datasetCapacity = static_cast<int>(std::min<std::uint64_t>(MaxSize, vectorCount + memoryBytes / 4));
+            m_options.m_update = true;
+            m_options.m_useKV = true;
+            m_options.m_excludehead = false;
+            m_options.m_iSSDNumberOfThreads = 1;
+            m_options.m_vectorSize = vectorCount;
+            m_versionMap.Initialize(vectorCount, static_cast<int>(rows), m_options.m_datasetCapacity);
+            auto mutableIndex = std::make_shared<ExtraDynamicSearcher<T>>(
+                m_options.m_KVPath.c_str(), m_options.m_dim,
+                std::max<int>(2, m_options.m_postingPageLimit * PageSize / (sizeof(T) * m_options.m_dim + sizeof(int) + 1)),
+                false, m_options.m_latencyLimit, m_options.m_mergeThreshold, false, 64, 3, memoryBytes);
+            mutableIndex->InitializeMutable(m_options, m_versionMap, m_index);
+            const auto plainRecordBytes = sizeof(int) + sizeof(T) * m_options.m_dim;
+            for (SizeType postingId = 0; postingId < heads; ++postingId) {
+                std::string original;
+                m_extraSearcher->GetWritePosting(postingId, original);
+                if (original.size() % plainRecordBytes != 0) throw std::runtime_error("invalid static posting size");
+                std::string posting;
+                posting.reserve(original.size() + original.size() / plainRecordBytes + plainRecordBytes + 1);
+                for (size_t offset = 0; offset < original.size(); offset += plainRecordBytes) {
+                    int id;
+                    memcpy(&id, original.data() + offset, sizeof(id));
+                    if (id < 0 || id >= vectorCount) continue;
+                    posting.append(original.data() + offset, sizeof(int));
+                    posting.push_back(static_cast<char>(m_versionMap.GetVersion(id)));
+                    posting.append(original.data() + offset + sizeof(int), plainRecordBytes - sizeof(int));
+                }
+                if (vectorCount > 0 && m_vectorTranslateMap && m_vectorTranslateMap.get()[postingId] < static_cast<std::uint64_t>(vectorCount)) {
+                    const int id = static_cast<int>(m_vectorTranslateMap.get()[postingId]);
+                    posting.append(reinterpret_cast<const char*>(&id), sizeof(id));
+                    posting.push_back(static_cast<char>(m_versionMap.GetVersion(id)));
+                    posting.append(reinterpret_cast<const char*>(m_index->GetSample(postingId)), sizeof(T) * m_options.m_dim);
+                }
+                mutableIndex->GetWritePosting(postingId, posting, true);
+            }
+            m_vectorTranslateMap.reset();
+            m_extraSearcher = std::move(mutableIndex);
+            m_bReady = true;
+            return ErrorCode::Success;
+        }
+
+        template <typename T>
+        ErrorCode Index<T>::AppendMutable(const void* data, SizeType vectorId)
+        {
+            if (!m_options.m_synchronousUpdates || vectorId != m_versionMap.GetVectorNum())
+                throw std::runtime_error("SPFresh incremental vector IDs must be contiguous");
+            auto status = AddIndex(data, 1, m_options.m_dim, nullptr, false, true);
+            if (status == ErrorCode::Success) m_options.m_vectorSize = vectorId + 1;
+            return status;
+        }
+
+        template <typename T>
+        bool Index<T>::MaintainMutable()
+        {
+            auto extra = std::dynamic_pointer_cast<ExtraDynamicSearcher<T>>(m_extraSearcher);
+            if (!extra) throw std::runtime_error("SPFresh mutable storage is not initialized");
+            return extra->MaintainOne();
+        }
+
+        template <typename T>
+        ErrorCode Index<T>::CheckpointMutableConfig(const std::string& directory)
+        {
+            auto extra = std::dynamic_pointer_cast<ExtraDynamicSearcher<T>>(m_extraSearcher);
+            if (!extra) throw std::runtime_error("SPFresh mutable storage is not initialized");
+            std::filesystem::create_directories(directory + "/HeadIndex");
+            auto config = f_createIO();
+            if (!config || !config->Initialize((directory + "/indexloader.ini").c_str(), std::ios::out))
+                throw std::runtime_error("SPFresh mutable config checkpoint open failed");
+            IOSTRING(config, WriteString, "[Index]\nIndexAlgoType=SPANN\n");
+            IOSTRING(config, WriteString, ("ValueType=" + Helper::Convert::ConvertToString(GetVectorValueType()) + "\n\n").c_str());
+            if (SaveConfig(config) != ErrorCode::Success) throw std::runtime_error("SPFresh mutable config checkpoint failed");
+            config.reset();
+            return ErrorCode::Success;
+        }
+
+        template <typename T>
+        ErrorCode Index<T>::CheckpointMutable(const std::string& directory)
+        {
+            auto extra = std::dynamic_pointer_cast<ExtraDynamicSearcher<T>>(m_extraSearcher);
+            auto head = std::dynamic_pointer_cast<BKT::Index<T>>(m_index);
+            if (!extra || !head) throw std::runtime_error("SPFresh mutable checkpoint requires a BKT head");
+            std::vector<std::shared_ptr<Helper::DiskIO>> streams;
+            const auto files = GetIndexFiles();
+            for (const auto& file : *files) {
+                auto stream = f_createIO();
+                if (!stream || !stream->Initialize((directory + "/" + file).c_str(), std::ios::binary | std::ios::out))
+                    throw std::runtime_error("SPFresh mutable head checkpoint open failed");
+                streams.push_back(std::move(stream));
+            }
+            if (head->SaveReadOnlyCheckpoint(streams) != ErrorCode::Success || m_versionMap.Save(directory + "/DeletedIDs.bin") != ErrorCode::Success)
+                throw std::runtime_error("SPFresh mutable checkpoint failed");
+            streams.clear();
+            extra->Checkpoint(directory);
+            return ErrorCode::Success;
         }
 
         template <typename T>

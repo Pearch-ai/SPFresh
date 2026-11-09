@@ -133,6 +133,11 @@ namespace SPTAG
             ErrorCode DebugSearchDiskIndex(QueryResult& p_query, int p_subInternalResultNum, int p_internalResultNum,
                 SearchStats* p_stats = nullptr, std::set<int>* truth = nullptr, std::map<int, std::set<int>>* found = nullptr) const;
             ErrorCode UpdateIndex();
+            ErrorCode EnableMutable(const std::string& directory, SizeType vectorCount, std::uint64_t memoryBytes);
+            ErrorCode CheckpointMutable(const std::string& directory);
+            ErrorCode CheckpointMutableConfig(const std::string& directory);
+            ErrorCode AppendMutable(const void* data, SizeType vectorId);
+            bool MaintainMutable();
 
             ErrorCode SetParameter(const char* p_param, const char* p_value, const char* p_section = nullptr);
             std::string GetParameter(const char* p_param, const char* p_section = nullptr) const;

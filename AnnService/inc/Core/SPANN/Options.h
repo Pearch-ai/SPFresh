@@ -149,6 +149,9 @@ namespace SPTAG {
             bool m_virtualHead;
 
             // Updating(SPFresh Update Test)
+            bool m_synchronousUpdates;
+            std::uint64_t m_liveMemoryBytes;
+            int m_liveHeadLimit;
             bool m_update;
             bool m_inPlace;
             bool m_outOfPlace;

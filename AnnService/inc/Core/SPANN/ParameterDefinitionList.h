@@ -193,4 +193,7 @@ DefineSSDParameter(m_disableReassign, bool, false, "DisableReassign")
 DefineSSDParameter(m_searchDuringUpdate, bool, false, "SearchDuringUpdate")
 DefineSSDParameter(m_reassignK, int, 0, "ReassignK")
 DefineSSDParameter(m_virtualHead, bool, false, "VirtualHead")
+DefineSSDParameter(m_synchronousUpdates, bool, false, "SynchronousUpdates")
+DefineSSDParameter(m_liveMemoryBytes, std::uint64_t, 0, "LiveMemoryBytes")
+DefineSSDParameter(m_liveHeadLimit, int, 0, "LiveHeadLimit")
 #endif

@@ -163,7 +163,7 @@ namespace SPTAG::SPANN {
         tbb::concurrent_hash_map<SizeType, SizeType> m_mergeList;
 
     public:
-        ExtraDynamicSearcher(const char* dbPath, int dim, int postingBlockLimit, bool useDirectIO, float searchLatencyHardLimit, int mergeThreshold, bool useSPDK = false, int batchSize = 64, int bufferLength = 3) {
+        ExtraDynamicSearcher(const char* dbPath, int dim, int postingBlockLimit, bool useDirectIO, float searchLatencyHardLimit, int mergeThreshold, bool useSPDK = false, int batchSize = 64, int bufferLength = 3, std::uint64_t memoryBytes = 0) {
             if (useSPDK) {
 #ifdef SPDK
                 db.reset(new SPDKIO(dbPath, 1024 * 1024, MaxSize, postingBlockLimit + bufferLength, 1024, batchSize));
@@ -173,7 +173,7 @@ namespace SPTAG::SPANN {
 #endif
             } else {
 #ifdef ROCKSDB
-                db.reset(new RocksDBIO(dbPath, useDirectIO));
+                db.reset(new RocksDBIO(dbPath, useDirectIO, false, memoryBytes, memoryBytes == 0 ? 0 : (sizeof(ValueType) * dim + sizeof(int) + 1)));
                 m_postingSizeLimit = postingBlockLimit;
 #endif
             }
@@ -470,6 +470,7 @@ namespace SPTAG::SPANN {
             // LOG(Helper::LogLevel::LL_Info, "into split: %d\n", headID);
             std::vector<SizeType> newHeadsID;
             std::vector<std::string> newPostingLists;
+            bool identicalSplit = false;
             double elapsedMSeconds;
             {
                 std::unique_lock<std::shared_timed_mutex> lock(m_rwLocks[headID]);
@@ -478,7 +479,7 @@ namespace SPTAG::SPANN {
                 auto splitGetBegin = std::chrono::high_resolution_clock::now();
                 if (db->Get(headID, &postingList) != ErrorCode::Success) {
                     LOG(Helper::LogLevel::LL_Info, "Split fail to get oversized postings\n");
-                    exit(0);
+                    throw std::runtime_error("SPFresh mutable posting operation failed");
                 }
                 auto splitGetEnd = std::chrono::high_resolution_clock::now();
                 elapsedMSeconds = std::chrono::duration_cast<std::chrono::microseconds>(splitGetEnd - splitGetBegin).count();
@@ -522,7 +523,7 @@ namespace SPTAG::SPANN {
                     m_postingSizes.UpdateSize(headID, index);
                     if (db->Put(headID, postingList) != ErrorCode::Success) {
                         LOG(Helper::LogLevel::LL_Info, "Split Fail to write back postings\n");
-                        exit(0);
+                        throw std::runtime_error("SPFresh mutable posting operation failed");
                     }
                     m_stat.m_garbageNum++;
                     auto GCEnd = std::chrono::high_resolution_clock::now();
@@ -550,27 +551,15 @@ namespace SPTAG::SPANN {
                 elapsedMSeconds = std::chrono::duration_cast<std::chrono::microseconds>(clusterEnd - clusterBegin).count();
                 m_stat.m_clusteringCost += elapsedMSeconds;
                 // int numClusters = ClusteringSPFresh(smallSample, localIndices, 0, localIndices.size(), args, 10, false, m_opt->m_virtualHead);
-                // exit(0);
+                // throw std::runtime_error("SPFresh mutable posting operation failed");
                 if (numClusters <= 1)
                 {
-                    LOG(Helper::LogLevel::LL_Info, "Cluserting Failed (The same vector), Only Keep one\n");
-                    std::string newpostingList(1 * m_vectorInfoSize, '\0');
-                    char* ptr = (char*)(newpostingList.c_str());
-                    for (int j = 0; j < 1; j++, ptr += m_vectorInfoSize)
-                    {
-                        memcpy(ptr, postingList.c_str() + localIndices[j] * m_vectorInfoSize, m_vectorInfoSize);
-                        //Serialize(ptr, localIndicesInsert[j], localIndicesInsertVersion[j], smallSample[j]);
+                    identicalSplit = true;
+                    args.counts[0] = static_cast<int>(localIndices.size() / 2);
+                    args.counts[1] = static_cast<int>(localIndices.size()) - args.counts[0];
+                    for (int k = 0; k < 2; ++k) {
+                        memcpy(args.centers + k * args._D, smallSample[localIndices[k == 0 ? 0 : args.counts[0]]], sizeof(ValueType) * m_opt->m_dim);
                     }
-                    m_postingSizes.UpdateSize(headID, 1);
-                    if (db->Put(headID, newpostingList) != ErrorCode::Success) {
-                        LOG(Helper::LogLevel::LL_Info, "Split fail to override postings cut to limit\n");
-                        exit(0);
-                    }
-                    {
-                        std::lock_guard<std::mutex> tmplock(m_runningLock);
-                        m_splitList.erase(headID);
-                    }
-                    return ErrorCode::Success;
                 }
 
                 long long newHeadVID = -1;
@@ -594,7 +583,7 @@ namespace SPTAG::SPANN {
                         auto splitPutBegin = std::chrono::high_resolution_clock::now();
                         if (!preReassign && db->Put(newHeadVID, newPostingLists[k]) != ErrorCode::Success) {
                             LOG(Helper::LogLevel::LL_Info, "Fail to override postings\n");
-                            exit(0);
+                            throw std::runtime_error("SPFresh mutable posting operation failed");
                         }
                         auto splitPutEnd = std::chrono::high_resolution_clock::now();
                         elapsedMSeconds = std::chrono::duration_cast<std::chrono::microseconds>(splitPutEnd - splitPutBegin).count();
@@ -603,13 +592,15 @@ namespace SPTAG::SPANN {
                     }
                     else {
                         int begin, end = 0;
+                        if (m_opt->m_liveHeadLimit > 0 && p_index->GetNumSamples() >= m_opt->m_liveHeadLimit)
+                            throw std::runtime_error("SPFresh centroid growth exceeds live memory budget");
                         p_index->AddIndexId(args.centers + k * args._D, 1, m_opt->m_dim, begin, end);
                         newHeadVID = begin;
                         newHeadsID.push_back(begin);
                         auto splitPutBegin = std::chrono::high_resolution_clock::now();
                         if (!preReassign && db->Put(newHeadVID, newPostingLists[k]) != ErrorCode::Success) {
                             LOG(Helper::LogLevel::LL_Info, "Fail to add new postings\n");
-                            exit(0);
+                            throw std::runtime_error("SPFresh mutable posting operation failed");
                         }
                         auto splitPutEnd = std::chrono::high_resolution_clock::now();
                         elapsedMSeconds = std::chrono::duration_cast<std::chrono::microseconds>(splitPutEnd - splitPutBegin).count();
@@ -623,7 +614,7 @@ namespace SPTAG::SPANN {
                         std::lock_guard<std::mutex> tmplock(m_dataAddLock);
                         if (m_postingSizes.AddBatch(1) == ErrorCode::MemoryOverFlow) {
                             LOG(Helper::LogLevel::LL_Info, "MemoryOverFlow: NnewHeadVID: %d, Map Size:%d\n", newHeadVID, m_postingSizes.BufferSize());
-                            exit(1);
+                            throw std::runtime_error("SPFresh mutable index capacity exceeded");
                         }
                     }
                     // LOG(Helper::LogLevel::LL_Info, "Head id: %d split into : %d, length: %d\n", headID, newHeadVID, args.counts[k]);
@@ -641,7 +632,7 @@ namespace SPTAG::SPANN {
                 m_splitList.erase(headID);
             }
             m_stat.m_splitNum++;
-            if (reassign) {
+            if (reassign && !identicalSplit) {
                 auto reassignScanBegin = std::chrono::high_resolution_clock::now();
 
                 CollectReAssign(p_index, headID, newPostingLists, newHeadsID);
@@ -678,7 +669,7 @@ namespace SPTAG::SPANN {
                 std::string currentPostingList;
                 if (db->Get(headID, &currentPostingList) != ErrorCode::Success) {
                     LOG(Helper::LogLevel::LL_Info, "Fail to get to be merged postings: %d\n", headID);
-                    exit(0);
+                    throw std::runtime_error("SPFresh mutable posting operation failed");
                 }
 
                 auto* postingP = reinterpret_cast<uint8_t*>(&currentPostingList.front());
@@ -701,7 +692,7 @@ namespace SPTAG::SPANN {
                     m_postingSizes.UpdateSize(headID, currentLength);
                     if (db->Put(headID, mergedPostingList) != ErrorCode::Success) {
                         LOG(Helper::LogLevel::LL_Info, "Merge Fail to write back postings\n");
-                        exit(0);
+                        throw std::runtime_error("SPFresh mutable posting operation failed");
                     }
                     m_mergeList.erase(headID);
                     m_mergeLock.unlock();
@@ -727,7 +718,7 @@ namespace SPTAG::SPANN {
                             if (!p_index->ContainSample(queryResult->VID)) continue;
                             if (db->Get(queryResult->VID, &nextPostingList) != ErrorCode::Success) {
                                 LOG(Helper::LogLevel::LL_Info, "Fail to get to be merged postings: %d\n", queryResult->VID);
-                                exit(0);
+                                throw std::runtime_error("SPFresh mutable posting operation failed");
                             }
 
                             postingP = reinterpret_cast<uint8_t*>(&nextPostingList.front());
@@ -750,7 +741,7 @@ namespace SPTAG::SPANN {
                                 p_index->DeleteIndex(queryResult->VID);
                                 if (db->Put(headID, mergedPostingList) != ErrorCode::Success) {
                                     LOG(Helper::LogLevel::LL_Info, "Split fail to override postings after merge\n");
-                                    exit(0);
+                                    throw std::runtime_error("SPFresh mutable posting operation failed");
                                 }
                                 m_postingSizes.UpdateSize(queryResult->VID, 0);
                                 m_postingSizes.UpdateSize(headID, totalLength);
@@ -759,7 +750,7 @@ namespace SPTAG::SPANN {
                                 p_index->DeleteIndex(headID);
                                 if (db->Put(queryResult->VID, mergedPostingList) != ErrorCode::Success) {
                                     LOG(Helper::LogLevel::LL_Info, "Split fail to override postings after merge\n");
-                                    exit(0);
+                                    throw std::runtime_error("SPFresh mutable posting operation failed");
                                 }
                                 m_postingSizes.UpdateSize(queryResult->VID, totalLength);
                                 m_postingSizes.UpdateSize(headID, 0);
@@ -812,7 +803,7 @@ namespace SPTAG::SPANN {
                 m_postingSizes.UpdateSize(headID, currentLength);
                 if (db->Put(headID, mergedPostingList) != ErrorCode::Success) {
                     LOG(Helper::LogLevel::LL_Info, "Merge Fail to write back postings\n");
-                    exit(0);
+                    throw std::runtime_error("SPFresh mutable posting operation failed");
                 }
                 m_mergeList.erase(headID);
                 m_mergeLock.unlock();
@@ -912,7 +903,7 @@ namespace SPTAG::SPANN {
                 auto reassignScanIOBegin = std::chrono::high_resolution_clock::now();
                 if (db->MultiGet(HeadPrevTopK, &postingLists) != ErrorCode::Success) {
                     LOG(Helper::LogLevel::LL_Info, "ReAssign can't get all the near postings\n");
-                    exit(0);
+                    throw std::runtime_error("SPFresh mutable posting operation failed");
                 }
                 auto reassignScanIOEnd = std::chrono::high_resolution_clock::now();
                 auto elapsedMSeconds = std::chrono::duration_cast<std::chrono::microseconds>(reassignScanIOEnd - reassignScanIOBegin).count();
@@ -939,7 +930,7 @@ namespace SPTAG::SPANN {
                     }
                 }
             }
-            // exit(1);
+            // throw std::runtime_error("SPFresh mutable index capacity exceeded");
             return ErrorCode::Success;
         }
 
@@ -1018,7 +1009,7 @@ namespace SPTAG::SPANN {
                 if (db->Merge(headID, appendPosting) != ErrorCode::Success) {
                     LOG(Helper::LogLevel::LL_Error, "Merge failed! Posting Size:%d, limit: %d\n", m_postingSizes.GetSize(headID), m_postingSizeLimit);
                     GetDBStats();
-                    exit(1);
+                    throw std::runtime_error("SPFresh mutable index capacity exceeded");
                 }
                 auto appendIOEnd = std::chrono::high_resolution_clock::now();
                 appendIOSeconds = std::chrono::duration_cast<std::chrono::microseconds>(appendIOEnd - appendIOBegin).count();
@@ -1030,7 +1021,7 @@ namespace SPTAG::SPANN {
                 // GetDBStats();
                 // if (m_postingSizes.GetSize(headID) > 120) {
                 //     GetDBStats();
-                //     exit(1);
+                //     throw std::runtime_error("SPFresh mutable index capacity exceeded");
                 // }
                 if (!reassignThreshold) SplitAsync(p_index, headID);
                 else Split(p_index, headID, !m_opt->m_disableReassign);
@@ -1095,6 +1086,29 @@ namespace SPTAG::SPANN {
             m_stat.m_reAssignCost += elapsedMSeconds;
         }
 
+        void InitializeMaintenance() {
+            if (m_opt->m_update) {
+                LOG(Helper::LogLevel::LL_Info, "SPFresh: initialize thread pools, append: %d, reassign %d\n", m_opt->m_synchronousUpdates ? 0 : m_opt->m_appendThreadNum, m_opt->m_synchronousUpdates ? 0 : m_opt->m_reassignThreadNum);
+                m_splitThreadPool = std::make_shared<SPDKThreadPool>();
+                m_splitThreadPool->initSPDK(m_opt->m_synchronousUpdates ? 0 : m_opt->m_appendThreadNum, this);
+                m_reassignThreadPool = std::make_shared<SPDKThreadPool>();
+                m_reassignThreadPool->initSPDK(m_opt->m_synchronousUpdates ? 0 : m_opt->m_reassignThreadNum, this);
+                if (m_opt->m_synchronousUpdates) {
+                    const auto limit = std::max<std::uint64_t>(1, m_opt->m_liveMemoryBytes / 64 / (m_vectorInfoSize + 256));
+                    m_splitThreadPool->setMaxJobs(limit);
+                    m_reassignThreadPool->setMaxJobs(limit);
+                }
+                LOG(Helper::LogLevel::LL_Info, "SPFresh: finish initialization\n");
+            }
+        }
+
+        void InitializeMutable(Options& options, COMMON::VersionLabel& versions, std::shared_ptr<VectorIndex> index) {
+            m_opt = &options;
+            m_versionMap = &versions;
+            InitPostingRecord(index);
+            InitializeMaintenance();
+        }
+
         bool LoadIndex(Options& p_opt, COMMON::VersionLabel& p_versionMap) override {
             m_versionMap = &p_versionMap;
             m_opt = &p_opt;
@@ -1125,6 +1139,8 @@ namespace SPTAG::SPANN {
                     versionLoadElapsedMs,
                     "status=" + std::to_string(static_cast<int>(versionLoadStatus)));
 
+                if (versionLoadStatus != ErrorCode::Success) return false;
+
                 const std::uint64_t ssdInfoFileBytes = TPSQL::FileSizeBytes(m_opt->m_ssdInfoFile);
                 const auto postingLoadStart = std::chrono::steady_clock::now();
                 TPSQL::LogMemoryEvent(
@@ -1148,18 +1164,12 @@ namespace SPTAG::SPANN {
                     m_postingSizes.BufferSize(),
                     postingLoadElapsedMs,
                     "status=" + std::to_string(static_cast<int>(postingLoadStatus)));
+                if (postingLoadStatus != ErrorCode::Success) return false;
                 LOG(Helper::LogLevel::LL_Info, "Current vector num: %d.\n", m_versionMap->GetVectorNum());
                 LOG(Helper::LogLevel::LL_Info, "Current posting num: %d.\n", m_postingSizes.GetPostingNum());
             }
 
-            if (m_opt->m_update) {
-                LOG(Helper::LogLevel::LL_Info, "SPFresh: initialize thread pools, append: %d, reassign %d\n", m_opt->m_appendThreadNum, m_opt->m_reassignThreadNum);
-                m_splitThreadPool = std::make_shared<SPDKThreadPool>();
-                m_splitThreadPool->initSPDK(m_opt->m_appendThreadNum, this);
-                m_reassignThreadPool = std::make_shared<SPDKThreadPool>();
-                m_reassignThreadPool->initSPDK(m_opt->m_reassignThreadNum, this);
-                LOG(Helper::LogLevel::LL_Info, "SPFresh: finish initialization\n");
-            }
+            InitializeMaintenance();
             return true;
         }
 
@@ -1168,6 +1178,8 @@ namespace SPTAG::SPANN {
             std::shared_ptr<VectorIndex> p_index,
             SearchStats* p_stats, std::set<int>* truth, std::map<int, std::set<int>>* found) override
         {
+            SearchStats localStats;
+            if (p_stats == nullptr) p_stats = &localStats;
             auto exStart = std::chrono::high_resolution_clock::now();
 
             // const auto postingListCount = static_cast<uint32_t>(p_exWorkSpace->m_postingIDs.size());
@@ -1215,7 +1227,7 @@ namespace SPTAG::SPANN {
                 for (int i = 0; i < vectorNum; i++) {
                     char* vectorInfo = postingList.data() + i * m_vectorInfoSize;
                     int vectorID = *(reinterpret_cast<int*>(vectorInfo));
-                    if (m_versionMap->Deleted(vectorID)) {
+                    if (m_versionMap->Deleted(vectorID) || m_versionMap->GetVersion(vectorID) != static_cast<uint8_t>(vectorInfo[sizeof(int)])) {
                         realNum--;
                         listElements--;
                         continue;
@@ -1233,7 +1245,7 @@ namespace SPTAG::SPANN {
                     queryResults.AddPoint(vectorID, distance2leaf, referenceDistance);
                 }
                 auto compEnd = std::chrono::high_resolution_clock::now();
-                if (realNum <= m_mergeThreshold && !m_opt->m_inPlace) MergeAsync(p_index.get(), curPostingID);
+                if (realNum <= m_mergeThreshold && !m_opt->m_inPlace && !m_opt->m_synchronousUpdates) MergeAsync(p_index.get(), curPostingID);
 
                 compLatency += ((double)std::chrono::duration_cast<std::chrono::microseconds>(compEnd - compStart).count());
 
@@ -1527,7 +1539,7 @@ namespace SPTAG::SPANN {
                         for (int j = 0; j < p_postingListSizes[index]; ++j) {
                             if (p_postingSelections[selectIdx].node != index) {
                                 LOG(Helper::LogLevel::LL_Error, "Selection ID NOT MATCH\n");
-                                exit(1);
+                                throw std::runtime_error("SPFresh mutable index capacity exceeded");
                             }
                             SizeType fullID = p_postingSelections[selectIdx++].tonode;
                             // if (id == 0) LOG(Helper::LogLevel::LL_Info, "ID: %d\n", fullID);
@@ -1606,6 +1618,22 @@ namespace SPTAG::SPANN {
             }
         }
 
+        bool MaintainOne() {
+            if (!m_opt->m_synchronousUpdates) throw std::runtime_error("SPFresh synchronous maintenance is disabled");
+            return m_reassignThreadPool->runOne() || m_splitThreadPool->runOne();
+        }
+
+        void Checkpoint(const std::string& directory) {
+            if (!AllFinished()) throw std::runtime_error("SPFresh maintenance is not drained");
+            if (m_postingSizes.Save(directory + "/SSDInfo.bin") != ErrorCode::Success)
+                throw std::runtime_error("SPFresh posting metadata checkpoint failed");
+#ifdef ROCKSDB
+            dynamic_cast<RocksDBIO&>(*db).Checkpoint(directory + "/rocks");
+#else
+            throw std::runtime_error("SPFresh mutable storage requires RocksDB");
+#endif
+        }
+
         bool AllFinished() { return m_splitThreadPool->allClear() && m_reassignThreadPool->allClear(); }
         void ForceCompaction() override { db->ForceCompaction(); }
         void GetDBStats() override { 
@@ -1614,6 +1642,21 @@ namespace SPTAG::SPANN {
         }
 
         void GetIndexStats(int finishedInsert, bool cost, bool reset) override { m_stat.PrintStat(finishedInsert, cost, reset); }
+
+        bool CheckPostingFilter(SizeType postingID, const ExtraWorkSpace* workspace) const override {
+            if (!m_opt->m_synchronousUpdates || !workspace || !workspace->HasVectorFilter()) return true;
+#ifdef ROCKSDB
+            auto ids = dynamic_cast<const RocksDBIO&>(*db).GetPostingIds(postingID);
+            for (size_t offset = 0; offset < ids.size(); offset += sizeof(SizeType)) {
+                SizeType id;
+                memcpy(&id, ids.data() + offset, sizeof(id));
+                if (workspace->CheckVectorFilter(id)) return true;
+            }
+            return false;
+#else
+            throw std::runtime_error("SPFresh mutable posting masks require RocksDB");
+#endif
+        }
 
         bool CheckValidPosting(SizeType postingID) override {
             return m_postingSizes.GetSize(postingID) > 0;
@@ -1629,10 +1672,10 @@ namespace SPTAG::SPANN {
 
         void GetWritePosting(SizeType pid, std::string& posting, bool write = false) override { 
             if (write) {
-                db->Put(pid, posting);
+                if (db->Put(pid, posting) != ErrorCode::Success) throw std::runtime_error("SPFresh posting import failed");
                 m_postingSizes.UpdateSize(pid, posting.size() / m_vectorInfoSize);
                 // LOG(Helper::LogLevel::LL_Info, "PostingSize: %d\n", m_postingSizes.GetSize(pid));
-                // exit(1);
+                // throw std::runtime_error("SPFresh mutable index capacity exceeded");
             } else {
                 db->Get(pid, &posting);
             }

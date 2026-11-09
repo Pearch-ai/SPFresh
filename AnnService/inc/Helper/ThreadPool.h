@@ -10,6 +10,8 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <memory>
+#include <stdexcept>
 
 namespace SPTAG
 {
@@ -45,6 +47,7 @@ namespace SPTAG
                 m_cond.notify_all();
                 for (auto&& t : m_threads) t.join();
                 m_threads.clear();
+                while (!m_jobs.empty()) { delete m_jobs.front(); m_jobs.pop(); }
             }
 
             void init(int numberOfThreads = 1)
@@ -76,9 +79,28 @@ namespace SPTAG
             {
                 {
                     std::lock_guard<std::mutex> lock(m_lock);
+                    if (m_maxJobs != 0 && m_jobs.size() >= m_maxJobs) {
+                        delete j;
+                        throw std::runtime_error("SPFresh maintenance queue exceeds memory budget");
+                    }
                     m_jobs.push(j);
                 }
                 m_cond.notify_one();
+            }
+
+            void setMaxJobs(size_t limit) { m_maxJobs = limit; }
+
+            bool runOne()
+            {
+                std::unique_ptr<Job> job;
+                {
+                    std::lock_guard<std::mutex> lock(m_lock);
+                    if (m_jobs.empty()) return false;
+                    job.reset(m_jobs.front());
+                    m_jobs.pop();
+                }
+                job->exec(&m_abort);
+                return true;
             }
 
             bool get(Job*& j)
@@ -103,6 +125,7 @@ namespace SPTAG
             inline bool allClear() { return currentJobs == 0 && jobsize() == 0; }
 
         protected:
+            size_t m_maxJobs = 0;
             std::atomic_uint32_t currentJobs{ 0 };
             std::queue<Job*> m_jobs;
             Abort m_abort;

@@ -1,3 +1,5 @@
+#include <rocksdb/write_batch.h>
+#include <rocksdb/utilities/checkpoint.h>
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
@@ -68,12 +70,13 @@ namespace SPTAG::SPANN
         };
 
     public:
-        RocksDBIO(const char* filePath, bool usdDirectIO, bool wal = false) {
+        RocksDBIO(const char* filePath, bool usdDirectIO, bool wal = false, std::uint64_t memoryBytes = 0, size_t postingRecordBytes = 0) {
+            m_postingRecordBytes = postingRecordBytes;
             dbPath = std::string(filePath);
             //dbOptions.statistics = rocksdb::CreateDBStatistics();
             dbOptions.create_if_missing = true;
             if (!wal) {
-                dbOptions.IncreaseParallelism();
+                if (memoryBytes == 0) dbOptions.IncreaseParallelism();
                 dbOptions.OptimizeLevelStyleCompaction();
                 dbOptions.merge_operator.reset(new AnnMergeOperator);
                 // dbOptions.statistics = rocksdb::CreateDBStatistics();
@@ -115,13 +118,19 @@ namespace SPTAG::SPANN
                 // block cache options
                 rocksdb::BlockBasedTableOptions table_options;
                 // table_options.block_cache = rocksdb::NewSimCache(rocksdb::NewLRUCache(1UL << 30), (8UL << 30), -1);
-                table_options.block_cache = rocksdb::NewLRUCache(3UL << 30);
+                table_options.block_cache = rocksdb::NewLRUCache(memoryBytes == 0 ? (3UL << 30) : std::min<std::uint64_t>(memoryBytes / 16, 64UL << 20), -1, true);
                 // table_options.no_block_cache = true;
 
                 // filter options
                 table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, true));
                 table_options.optimize_filters_for_memory = true;
 
+                if (memoryBytes != 0) {
+                    dbOptions.max_background_jobs = 1;
+                    dbOptions.max_subcompactions = 1;
+                    dbOptions.write_buffer_size = std::max<std::uint64_t>(4096, std::min<std::uint64_t>(memoryBytes / 64, 4UL << 20));
+                    dbOptions.max_write_buffer_number = 2;
+                }
                 dbOptions.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
             }
 
@@ -134,7 +143,19 @@ namespace SPTAG::SPANN
             LOG(Helper::LogLevel::LL_Info, "SPFresh: New Rocksdb: %s\n", filePath);
             if (s != rocksdb::Status::OK()) {
                 LOG(Helper::LogLevel::LL_Error, "\e[0;31mRocksdb Open Error\e[0m: %s\n", s.getState());
+                if (memoryBytes != 0) throw std::runtime_error(s.ToString());
             }
+        }
+
+        void Checkpoint(const std::string& path) {
+            auto status = db->FlushWAL(true);
+            if (!status.ok()) throw std::runtime_error(status.ToString());
+            rocksdb::Checkpoint* checkpoint = nullptr;
+            status = rocksdb::Checkpoint::Create(db, &checkpoint);
+            if (!status.ok()) throw std::runtime_error(status.ToString());
+            std::unique_ptr<rocksdb::Checkpoint> owned(checkpoint);
+            status = owned->CreateCheckpoint(path);
+            if (!status.ok()) throw std::runtime_error(status.ToString());
         }
 
         ~RocksDBIO() override {
@@ -214,7 +235,10 @@ namespace SPTAG::SPANN
         }
 
         ErrorCode Put(const std::string& key, const std::string& value) override {
-            auto s = db->Put(rocksdb::WriteOptions(), key, value);
+            rocksdb::WriteBatch batch;
+            batch.Put(key, value);
+            if (m_postingRecordBytes != 0 && key.size() == sizeof(SizeType)) batch.Put("mask" + key, PostingIds(value));
+            auto s = db->Write(rocksdb::WriteOptions(), &batch);
             if (s == rocksdb::Status::OK()) {
                 return ErrorCode::Success;
             }
@@ -234,7 +258,10 @@ namespace SPTAG::SPANN
                 LOG(Helper::LogLevel::LL_Error, "Error! empty append posting!\n");
             }
             std::string k((char*)&key, sizeof(SizeType));
-            auto s = db->Merge(rocksdb::WriteOptions(), k, value);
+            rocksdb::WriteBatch batch;
+            batch.Merge(k, value);
+            if (m_postingRecordBytes != 0) batch.Merge("mask" + k, PostingIds(value));
+            auto s = db->Write(rocksdb::WriteOptions(), &batch);
             if (s == rocksdb::Status::OK()) {
                 return ErrorCode::Success;
             }
@@ -242,6 +269,13 @@ namespace SPTAG::SPANN
                 LOG(Helper::LogLevel::LL_Error, "\e[0;31mError in Merge\e[0m: %s, key: %d\n", s.getState(), key);
                 return ErrorCode::Fail;
             }
+        }
+
+        std::string GetPostingIds(SizeType key) const {
+            std::string ids;
+            auto status = db->Get(rocksdb::ReadOptions(), "mask" + std::string(reinterpret_cast<const char*>(&key), sizeof(key)), &ids);
+            if (!status.ok()) throw std::runtime_error("SPFresh posting mask read failed: " + status.ToString());
+            return ids;
         }
 
         ErrorCode Delete(SizeType key) override {
@@ -282,6 +316,14 @@ namespace SPTAG::SPANN
         }
 
     private:
+        std::string PostingIds(const std::string& posting) const {
+            if (posting.size() % m_postingRecordBytes != 0) throw std::runtime_error("invalid mutable posting record size");
+            std::string ids;
+            ids.reserve(posting.size() / m_postingRecordBytes * sizeof(SizeType));
+            for (size_t offset = 0; offset < posting.size(); offset += m_postingRecordBytes) ids.append(posting.data() + offset, sizeof(SizeType));
+            return ids;
+        }
+        size_t m_postingRecordBytes = 0;
         std::string dbPath;
         rocksdb::DB* db{};
         rocksdb::Options dbOptions;
