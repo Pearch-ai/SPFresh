@@ -50,7 +50,7 @@ namespace SPTAG
             float* weightedCounts;
             float* newWeightedCounts;
             std::function<float(const T*, const T*, DimensionType)> fComputeDistance;
-            const std::shared_ptr<IQuantizer>& m_pQuantizer;
+            std::shared_ptr<IQuantizer> m_pQuantizer;
 
             KmeansArgs(int k, DimensionType dim, SizeType datasize, int threadnum, DistCalcMethod distMethod, const std::shared_ptr<IQuantizer>& quantizer = nullptr) : _K(k), _DK(k), _D(dim), _RD(dim), _T(threadnum), _M(distMethod), m_pQuantizer(quantizer){
                 if (m_pQuantizer) {
