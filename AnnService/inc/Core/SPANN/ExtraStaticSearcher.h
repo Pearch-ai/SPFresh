@@ -1823,17 +1823,22 @@ namespace SPTAG
                 ListInfo* listInfo = &(m_listInfos[pid]);
                 size_t totalBytes = (static_cast<size_t>(listInfo->listPageCount) << PageSizeEx);
                 size_t realBytes = listInfo->listEleCount * m_vectorInfoSize;
-                posting.resize(totalBytes);
+                if (totalBytes == 0) {
+                    posting.clear();
+                    return;
+                }
+                // The file is opened for direct I/O, which needs a page-aligned buffer on devices that
+                // do not accept arbitrary memory alignment; a std::string buffer is not aligned.
+                PageBuffer<char> buffer;
+                buffer.ReservePageBuffer(totalBytes);
                 int fileid = m_oneContext? 0: pid / m_listPerFile;
                 Helper::DiskIO* indexFile = m_indexFiles[fileid].get();
-                auto numRead = indexFile->ReadBinary(totalBytes, posting.data(), listInfo->listOffset);
+                auto numRead = indexFile->ReadBinary(totalBytes, buffer.GetBuffer(), listInfo->listOffset);
                 if (numRead != totalBytes) {
                     LOG(Helper::LogLevel::LL_Error, "File %s read bytes, expected: %zu, acutal: %llu.\n", m_extraFullGraphFile.c_str(), totalBytes, numRead);
                     throw std::runtime_error("File read mismatch");
                 }
-                char* ptr = (char*)(posting.c_str());
-                memmove(ptr, posting.c_str() + listInfo->pageOffset, realBytes);
-                posting.resize(realBytes);
+                posting.assign(buffer.GetBuffer() + listInfo->pageOffset, realBytes);
             }
 
         private:
