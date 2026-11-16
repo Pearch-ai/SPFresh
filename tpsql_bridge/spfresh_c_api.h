@@ -81,6 +81,9 @@ tpsql_spfresh_status tpsql_spfresh_search(
 
 tpsql_spfresh_status tpsql_spfresh_enable_mutable(tpsql_spfresh_index* index, const char* directory, uint32_t vector_count, uint64_t memory_bytes);
 tpsql_spfresh_status tpsql_spfresh_append_mutable(tpsql_spfresh_index* index, const void* vector, uint32_t vector_id);
+tpsql_spfresh_status tpsql_spfresh_select_mutable_heads(tpsql_spfresh_index* index, const void* vectors, uint32_t count, uint32_t replicas, int32_t* heads);
+tpsql_spfresh_status tpsql_spfresh_append_mutable_batch(tpsql_spfresh_index* index, const void* vectors, uint32_t first_vector_id, uint32_t count, uint32_t replicas, const int32_t* heads);
+tpsql_spfresh_status tpsql_spfresh_mutable_head_count(tpsql_spfresh_index* index, uint32_t* heads);
 tpsql_spfresh_status tpsql_spfresh_maintain_mutable(tpsql_spfresh_index* index, int* did_work);
 tpsql_spfresh_status tpsql_spfresh_checkpoint_mutable_config(tpsql_spfresh_index* index, const char* directory);
 tpsql_spfresh_status tpsql_spfresh_checkpoint_mutable(tpsql_spfresh_index* index, const char* directory);

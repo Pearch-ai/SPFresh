@@ -1326,6 +1326,46 @@ namespace SPTAG
         }
 
         template <typename T>
+        ErrorCode Index<T>::SelectMutableHeads(const void* data, SizeType count, int replicas, SizeType* heads)
+        {
+            auto extra = std::dynamic_pointer_cast<ExtraDynamicSearcher<T>>(m_extraSearcher);
+            if (!extra) throw std::runtime_error("SPFresh mutable storage is not initialized");
+            if (data == nullptr || heads == nullptr || count <= 0 || replicas <= 0) return ErrorCode::EmptyData;
+            const auto* vectors = static_cast<const T*>(data);
+            for (SizeType i = 0; i < count; ++i)
+                extra->SelectHeads(vectors + static_cast<size_t>(i) * m_options.m_dim, m_index.get(), replicas, heads + static_cast<size_t>(i) * replicas);
+            return ErrorCode::Success;
+        }
+
+        template <typename T>
+        ErrorCode Index<T>::AppendMutableBatch(const void* data, SizeType firstVectorId, SizeType count, int replicas, const SizeType* heads)
+        {
+            auto extra = std::dynamic_pointer_cast<ExtraDynamicSearcher<T>>(m_extraSearcher);
+            if (!extra) throw std::runtime_error("SPFresh mutable storage is not initialized");
+            if (data == nullptr || heads == nullptr || count <= 0 || replicas <= 0) return ErrorCode::EmptyData;
+            SizeType begin;
+            {
+                std::lock_guard<std::mutex> lock(m_dataAddLock);
+                begin = m_versionMap.GetVectorNum();
+                if (!m_options.m_synchronousUpdates || firstVectorId != begin)
+                    throw std::runtime_error("SPFresh incremental vector IDs must be contiguous");
+                if (m_versionMap.AddBatch(count) != ErrorCode::Success) {
+                    LOG(Helper::LogLevel::LL_Info, "MemoryOverFlow: VID: %d, Map Size:%d\n", begin, m_versionMap.BufferSize());
+                    throw std::runtime_error("SPFresh vector metadata capacity exceeded");
+                }
+                if (m_pMetadata != nullptr) {
+                    for (SizeType i = 0; i < count; i++) m_pMetadata->Add(ByteArray::c_empty);
+                }
+            }
+            std::shared_ptr<VectorSet> vectorSet(new BasicVectorSet(
+                ByteArray((std::uint8_t*)data, sizeof(T) * static_cast<size_t>(count) * m_options.m_dim, false),
+                GetEnumValueType<T>(), m_options.m_dim, count));
+            auto status = extra->AddIndexBatch(vectorSet, m_index, begin, heads, replicas);
+            if (status == ErrorCode::Success) m_options.m_vectorSize = begin + count;
+            return status;
+        }
+
+        template <typename T>
         bool Index<T>::MaintainMutable()
         {
             auto extra = std::dynamic_pointer_cast<ExtraDynamicSearcher<T>>(m_extraSearcher);

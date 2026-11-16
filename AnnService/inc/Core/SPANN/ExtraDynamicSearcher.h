@@ -1583,6 +1583,224 @@ namespace SPTAG::SPANN {
             return ErrorCode::Success;
         }
 
+        // Chooses up to p_replicas postings for one vector the way a single insert does. Reads the head
+        // index only, so it may run while searches do.
+        void SelectHeads(const void* p_vector, VectorIndex* p_index, int p_replicas, SizeType* p_heads)
+        {
+            QueryResult queryResults(p_vector, m_opt->m_internalResultNum, false);
+            p_index->SearchIndex(queryResults);
+
+            int selected = 0;
+            for (int i = 0; i < queryResults.GetResultNum() && selected < p_replicas; ++i)
+            {
+                BasicResult* queryResult = queryResults.GetResult(i);
+                if (queryResult->VID == -1) break;
+                bool accepted = true;
+                for (int j = 0; j < selected; ++j)
+                {
+                    float headDistance = p_index->ComputeDistance(p_index->GetSample(queryResult->VID), p_index->GetSample(p_heads[j]));
+                    if (m_opt->m_rngFactor * headDistance <= queryResult->Dist)
+                    {
+                        accepted = false;
+                        break;
+                    }
+                }
+                if (accepted) p_heads[selected++] = queryResult->VID;
+            }
+            for (int i = selected; i < p_replicas; ++i) p_heads[i] = -1;
+        }
+
+        struct BatchPiece
+        {
+            SizeType first;
+            SizeType last;
+            std::vector<ValueType> center;
+        };
+
+        // Splits indices[first, last) of a posting held in memory until every part fits a posting.
+        void BisectInMemory(VectorIndex* p_index, const COMMON::Dataset<ValueType>& p_sample, std::vector<SizeType>& p_indices,
+            SizeType p_first, SizeType p_last, std::vector<BatchPiece>& p_pieces)
+        {
+            SPTAG::COMMON::KmeansArgs<ValueType> args(2, p_sample.C(), (SizeType)p_indices.size(), 1, p_index->GetDistCalcMethod());
+            std::shuffle(p_indices.begin() + p_first, p_indices.begin() + p_last, std::mt19937(std::random_device()()));
+            int clusters = SPTAG::COMMON::KmeansClustering(p_sample, p_indices, p_first, p_last, args, 1000, 100.0F, false, nullptr, m_opt->m_virtualHead);
+            SizeType counts[2] = { args.counts[0], args.counts[1] };
+            std::vector<ValueType> centers(static_cast<size_t>(2) * m_opt->m_dim);
+            if (clusters <= 1 || counts[0] <= 0 || counts[1] <= 0)
+            {
+                counts[0] = (p_last - p_first) / 2;
+                counts[1] = (p_last - p_first) - counts[0];
+                memcpy(centers.data(), p_sample[p_indices[p_first]], sizeof(ValueType) * m_opt->m_dim);
+                memcpy(centers.data() + m_opt->m_dim, p_sample[p_indices[p_first + counts[0]]], sizeof(ValueType) * m_opt->m_dim);
+            }
+            else
+            {
+                memcpy(centers.data(), args.centers, sizeof(ValueType) * 2 * m_opt->m_dim);
+                SizeType total = p_last - p_first;
+                if (std::min(counts[0], counts[1]) * 3 < total)
+                {
+                    // A lopsided split leaves a nearly empty posting behind. Cut at the median of the
+                    // difference between the two centre distances instead, so both parts are half full.
+                    std::vector<std::pair<float, SizeType>> order;
+                    order.reserve(static_cast<size_t>(total));
+                    for (SizeType i = p_first; i < p_last; ++i)
+                    {
+                        const void* vector = p_sample[p_indices[i]];
+                        order.emplace_back(p_index->ComputeDistance(vector, centers.data()) - p_index->ComputeDistance(vector, centers.data() + m_opt->m_dim), p_indices[i]);
+                    }
+                    std::nth_element(order.begin(), order.begin() + total / 2, order.end());
+                    for (SizeType i = 0; i < total; ++i) p_indices[p_first + i] = order[static_cast<size_t>(i)].second;
+                    counts[0] = total / 2;
+                    counts[1] = total - counts[0];
+                }
+            }
+            SizeType begin = p_first;
+            for (int k = 0; k < 2; ++k)
+            {
+                SizeType end = begin + counts[k];
+                if (counts[k] > m_postingSizeLimit)
+                {
+                    BisectInMemory(p_index, p_sample, p_indices, begin, end, p_pieces);
+                }
+                else
+                {
+                    BatchPiece piece;
+                    piece.first = begin;
+                    piece.last = end;
+                    piece.center.assign(centers.begin() + static_cast<size_t>(k) * m_opt->m_dim, centers.begin() + static_cast<size_t>(k + 1) * m_opt->m_dim);
+                    p_pieces.push_back(std::move(piece));
+                }
+                begin = end;
+            }
+        }
+
+        // Adds the batch members chosen for one posting. The posting is read once, cleared of deleted and
+        // stale records, and written back; when it no longer fits it is split in memory into as many
+        // postings as it needs, each written once. Returns false when the head no longer exists.
+        bool MergeBatchIntoPosting(VectorIndex* p_index, SizeType headID, const std::vector<SizeType>& p_members,
+            std::shared_ptr<VectorSet>& p_vectorSet, SizeType p_begin)
+        {
+            std::unique_lock<std::shared_timed_mutex> lock(m_rwLocks[headID]);
+            if (!p_index->ContainSample(headID)) return false;
+
+            std::string postingList;
+            if (db->Get(headID, &postingList) != ErrorCode::Success) {
+                LOG(Helper::LogLevel::LL_Info, "Batch append fail to get posting %d\n", headID);
+                throw std::runtime_error("SPFresh mutable posting operation failed");
+            }
+            std::string combined;
+            combined.reserve(postingList.size() + p_members.size() * m_vectorInfoSize);
+            size_t existing = postingList.size() / m_vectorInfoSize;
+            for (size_t j = 0; j < existing; ++j)
+            {
+                const char* record = postingList.data() + j * m_vectorInfoSize;
+                SizeType VID = *(reinterpret_cast<const int*>(record));
+                uint8_t version = *(reinterpret_cast<const uint8_t*>(record + sizeof(int)));
+                if (m_versionMap->Deleted(VID) || m_versionMap->GetVersion(VID) != version) continue;
+                combined.append(record, m_vectorInfoSize);
+            }
+            for (SizeType member : p_members)
+            {
+                SizeType VID = p_begin + member;
+                size_t offset = combined.size();
+                combined.resize(offset + m_vectorInfoSize);
+                Serialize(&combined[offset], VID, m_versionMap->GetVersion(VID), p_vectorSet->GetVector(member));
+            }
+            SizeType total = (SizeType)(combined.size() / m_vectorInfoSize);
+            m_stat.m_appendTaskNum += (int)p_members.size();
+            if (total <= m_postingSizeLimit)
+            {
+                m_postingSizes.UpdateSize(headID, total);
+                if (db->Put(headID, combined) != ErrorCode::Success) {
+                    LOG(Helper::LogLevel::LL_Info, "Batch append fail to write posting %d\n", headID);
+                    throw std::runtime_error("SPFresh mutable posting operation failed");
+                }
+                return true;
+            }
+
+            COMMON::Dataset<ValueType> sample(total, m_opt->m_dim, p_index->m_iDataBlockSize, p_index->m_iDataCapacity, (const void*)combined.data(), true, nullptr, m_metaDataSize, m_vectorInfoSize);
+            std::vector<SizeType> indices(total);
+            std::iota(indices.begin(), indices.end(), 0);
+            std::vector<BatchPiece> pieces;
+            BisectInMemory(p_index, sample, indices, 0, total, pieces);
+
+            bool keptHead = false;
+            for (const BatchPiece& piece : pieces)
+            {
+                SizeType count = piece.last - piece.first;
+                std::string pieceList(static_cast<size_t>(count) * m_vectorInfoSize, '\0');
+                char* ptr = &pieceList[0];
+                for (SizeType j = piece.first; j < piece.last; ++j, ptr += m_vectorInfoSize)
+                    memcpy(ptr, combined.data() + static_cast<size_t>(indices[j]) * m_vectorInfoSize, m_vectorInfoSize);
+
+                if (!keptHead && p_index->ComputeDistance(piece.center.data(), p_index->GetSample(headID)) < Epsilon)
+                {
+                    keptHead = true;
+                    if (db->Put(headID, pieceList) != ErrorCode::Success) {
+                        LOG(Helper::LogLevel::LL_Info, "Batch append fail to override posting %d\n", headID);
+                        throw std::runtime_error("SPFresh mutable posting operation failed");
+                    }
+                    m_postingSizes.UpdateSize(headID, count);
+                    continue;
+                }
+                int begin, end = 0;
+                if (m_opt->m_liveHeadLimit > 0 && p_index->GetNumSamples() >= m_opt->m_liveHeadLimit)
+                    throw std::runtime_error("SPFresh centroid growth exceeds live memory budget");
+                p_index->AddIndexId(piece.center.data(), 1, m_opt->m_dim, begin, end);
+                if (db->Put(begin, pieceList) != ErrorCode::Success) {
+                    LOG(Helper::LogLevel::LL_Info, "Batch append fail to add posting %d\n", begin);
+                    throw std::runtime_error("SPFresh mutable posting operation failed");
+                }
+                p_index->AddIndexIdx(begin, end);
+                {
+                    std::lock_guard<std::mutex> tmplock(m_dataAddLock);
+                    if (m_postingSizes.AddBatch(1) == ErrorCode::MemoryOverFlow) {
+                        LOG(Helper::LogLevel::LL_Info, "MemoryOverFlow: new head %d, Map Size:%d\n", begin, m_postingSizes.BufferSize());
+                        throw std::runtime_error("SPFresh mutable index capacity exceeded");
+                    }
+                }
+                m_postingSizes.UpdateSize(begin, count);
+            }
+            if (!keptHead)
+            {
+                p_index->DeleteIndex(headID);
+                m_postingSizes.UpdateSize(headID, 0);
+            }
+            m_stat.m_splitNum += (int)pieces.size() - 1;
+            return true;
+        }
+
+        // Appends a batch of new vectors whose postings were chosen with SelectHeads. Members of the same
+        // posting are added together, so a burst of nearby vectors costs one read and a few writes per
+        // posting instead of a split per vector.
+        ErrorCode AddIndexBatch(std::shared_ptr<VectorSet>& p_vectorSet, std::shared_ptr<VectorIndex> p_index, SizeType p_begin,
+            const SizeType* p_heads, int p_replicas)
+        {
+            std::map<SizeType, std::vector<SizeType>> groups;
+            for (SizeType v = 0; v < p_vectorSet->Count(); ++v)
+            {
+                for (int r = 0; r < p_replicas; ++r)
+                {
+                    SizeType headID = p_heads[static_cast<size_t>(v) * p_replicas + r];
+                    if (headID < 0) break;
+                    groups[headID].push_back(v);
+                }
+            }
+            std::vector<SizeType> retry(static_cast<size_t>(p_replicas));
+            for (auto& group : groups)
+            {
+                if (MergeBatchIntoPosting(p_index.get(), group.first, group.second, p_vectorSet, p_begin)) continue;
+                for (SizeType member : group.second)
+                {
+                    SelectHeads(p_vectorSet->GetVector(member), p_index.get(), p_replicas, retry.data());
+                    std::vector<SizeType> single(1, member);
+                    if (retry[0] < 0 || !MergeBatchIntoPosting(p_index.get(), retry[0], single, p_vectorSet, p_begin))
+                        throw std::runtime_error("SPFresh batch append found no posting for a vector");
+                }
+            }
+            return ErrorCode::Success;
+        }
+
         SizeType SearchVector(std::shared_ptr<VectorSet>& p_vectorSet,
             std::shared_ptr<VectorIndex> p_index, int testNum = 64, SizeType VID = -1) override {
             

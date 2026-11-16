@@ -137,6 +137,9 @@ namespace SPTAG
             ErrorCode CheckpointMutable(const std::string& directory);
             ErrorCode CheckpointMutableConfig(const std::string& directory);
             ErrorCode AppendMutable(const void* data, SizeType vectorId);
+            SizeType GetHeadCount() const { return m_index ? m_index->GetNumSamples() : 0; }
+            ErrorCode SelectMutableHeads(const void* data, SizeType count, int replicas, SizeType* heads);
+            ErrorCode AppendMutableBatch(const void* data, SizeType firstVectorId, SizeType count, int replicas, const SizeType* heads);
             bool MaintainMutable();
 
             ErrorCode SetParameter(const char* p_param, const char* p_value, const char* p_section = nullptr);
