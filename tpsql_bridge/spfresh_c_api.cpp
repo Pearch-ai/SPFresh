@@ -778,6 +778,30 @@ extern "C" tpsql_spfresh_status tpsql_spfresh_append_mutable(tpsql_spfresh_index
     if (!vector || id >= static_cast<uint32_t>(INT_MAX)) return TPSQL_SPFRESH_INVALID_ARGUMENT;
     return mutable_action(handle, [&](auto index) { return index->AppendMutable(vector, id); });
 }
+extern "C" tpsql_spfresh_status tpsql_spfresh_reserve_mutable_batch(tpsql_spfresh_index* handle, uint32_t first_id, uint32_t count)
+{
+    if (count == 0 || first_id >= static_cast<uint32_t>(INT_MAX) || count >= static_cast<uint32_t>(INT_MAX) - first_id) return TPSQL_SPFRESH_INVALID_ARGUMENT;
+    return mutable_action(handle, [&](auto index) {
+        return index->ReserveMutableBatch(static_cast<SPTAG::SizeType>(first_id), static_cast<SPTAG::SizeType>(count));
+    });
+}
+extern "C" tpsql_spfresh_status tpsql_spfresh_prepare_mutable_batch(tpsql_spfresh_index* handle, const void* vectors, uint32_t first_id, uint32_t count, uint32_t replicas)
+{
+    if (!vectors || count == 0 || replicas == 0 || replicas > 64) return TPSQL_SPFRESH_INVALID_ARGUMENT;
+    if (first_id >= static_cast<uint32_t>(INT_MAX) || count >= static_cast<uint32_t>(INT_MAX) - first_id) return TPSQL_SPFRESH_INVALID_ARGUMENT;
+    return mutable_action(handle, [&](auto index) {
+        return index->PrepareMutableBatch(vectors, static_cast<SPTAG::SizeType>(first_id), static_cast<SPTAG::SizeType>(count), static_cast<int>(replicas));
+    });
+}
+extern "C" tpsql_spfresh_status tpsql_spfresh_commit_mutable_batch(tpsql_spfresh_index* handle)
+{
+    return mutable_action(handle, [&](auto index) { return index->CommitMutableBatch(); });
+}
+extern "C" tpsql_spfresh_status tpsql_spfresh_mutable_head_count(tpsql_spfresh_index* handle, uint32_t* heads)
+{
+    if (!heads) return TPSQL_SPFRESH_INVALID_ARGUMENT;
+    return mutable_action(handle, [&](auto index) { *heads = static_cast<uint32_t>(index->GetHeadCount()); return SPTAG::ErrorCode::Success; });
+}
 extern "C" tpsql_spfresh_status tpsql_spfresh_maintain_mutable(tpsql_spfresh_index* handle, int* did_work)
 {
     if (!did_work) return TPSQL_SPFRESH_INVALID_ARGUMENT;

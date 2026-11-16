@@ -1326,6 +1326,47 @@ namespace SPTAG
         }
 
         template <typename T>
+        ErrorCode Index<T>::ReserveMutableBatch(SizeType firstVectorId, SizeType count)
+        {
+            if (count <= 0) return ErrorCode::EmptyData;
+            std::lock_guard<std::mutex> lock(m_dataAddLock);
+            if (!m_options.m_synchronousUpdates || firstVectorId != m_versionMap.GetVectorNum())
+                throw std::runtime_error("SPFresh incremental vector IDs must be contiguous");
+            if (m_versionMap.AddBatch(count) != ErrorCode::Success) {
+                LOG(Helper::LogLevel::LL_Info, "MemoryOverFlow: VID: %d, Map Size:%d\n", firstVectorId, m_versionMap.BufferSize());
+                throw std::runtime_error("SPFresh vector metadata capacity exceeded");
+            }
+            if (m_pMetadata != nullptr) {
+                for (SizeType i = 0; i < count; i++) m_pMetadata->Add(ByteArray::c_empty);
+            }
+            return ErrorCode::Success;
+        }
+
+        template <typename T>
+        ErrorCode Index<T>::PrepareMutableBatch(const void* data, SizeType firstVectorId, SizeType count, int replicas)
+        {
+            auto extra = std::dynamic_pointer_cast<ExtraDynamicSearcher<T>>(m_extraSearcher);
+            if (!extra) throw std::runtime_error("SPFresh mutable storage is not initialized");
+            if (data == nullptr || count <= 0 || replicas <= 0) return ErrorCode::EmptyData;
+            if (firstVectorId + count != m_versionMap.GetVectorNum())
+                throw std::runtime_error("SPFresh batch was not reserved before it was prepared");
+            std::shared_ptr<VectorSet> vectorSet(new BasicVectorSet(
+                ByteArray((std::uint8_t*)data, sizeof(T) * static_cast<size_t>(count) * m_options.m_dim, false),
+                GetEnumValueType<T>(), m_options.m_dim, count));
+            return extra->PrepareBatch(vectorSet, m_index, firstVectorId, replicas);
+        }
+
+        template <typename T>
+        ErrorCode Index<T>::CommitMutableBatch()
+        {
+            auto extra = std::dynamic_pointer_cast<ExtraDynamicSearcher<T>>(m_extraSearcher);
+            if (!extra) throw std::runtime_error("SPFresh mutable storage is not initialized");
+            auto status = extra->CommitBatch(m_index.get());
+            if (status == ErrorCode::Success) m_options.m_vectorSize = m_versionMap.GetVectorNum();
+            return status;
+        }
+
+        template <typename T>
         bool Index<T>::MaintainMutable()
         {
             auto extra = std::dynamic_pointer_cast<ExtraDynamicSearcher<T>>(m_extraSearcher);
