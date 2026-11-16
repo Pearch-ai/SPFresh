@@ -130,6 +130,13 @@ namespace SPTAG::SPANN
                     dbOptions.max_subcompactions = 1;
                     dbOptions.write_buffer_size = std::max<std::uint64_t>(4096, std::min<std::uint64_t>(memoryBytes / 64, 4UL << 20));
                     dbOptions.max_write_buffer_number = 2;
+                    // A live index rewrites postings all over the key space, so every compaction meets
+                    // every key. With blob garbage collection on, each compaction also copies the live
+                    // blobs out of the oldest blob files: 27 GB and nine minutes per compaction on a
+                    // 110 GB shard, with writes stalled behind it. Superseded blobs stay on disk until
+                    // the index is converted again.
+                    dbOptions.enable_blob_garbage_collection = false;
+                    dbOptions.level0_file_num_compaction_trigger = 8;
                 }
                 dbOptions.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
             }
