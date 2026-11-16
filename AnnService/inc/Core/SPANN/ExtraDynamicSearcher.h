@@ -1685,9 +1685,10 @@ namespace SPTAG::SPANN {
             std::vector<std::string> pieceLists;
         };
 
-        // The batch that PrepareBatch planned and CommitBatch has not written yet. One maintenance thread
-        // prepares and commits, so there is never more than one.
+        // The batch that PrepareBatch planned and CommitBatch has not written yet, and the vector count it
+        // ends at. One maintenance thread prepares and commits, so there is never more than one.
         std::vector<BatchPosting> m_pendingBatch;
+        SizeType m_pendingBatchEnd = -1;
 
         // Plans the new content of one posting that receives batch members. It reads the posting, drops
         // deleted and stale records, adds the members and, when the result no longer fits, splits it in
@@ -1751,6 +1752,7 @@ namespace SPTAG::SPANN {
         ErrorCode PrepareBatch(std::shared_ptr<VectorSet>& p_vectorSet, std::shared_ptr<VectorIndex> p_index, SizeType p_begin, int p_replicas)
         {
             m_pendingBatch.clear();
+            m_pendingBatchEnd = -1;
             std::map<SizeType, std::vector<SizeType>> groups;
             std::vector<SizeType> heads(static_cast<size_t>(p_replicas));
             for (SizeType v = 0; v < p_vectorSet->Count(); ++v)
@@ -1769,6 +1771,7 @@ namespace SPTAG::SPANN {
             size_t next = 0;
             for (auto& group : groups)
                 PrepareBatchPosting(p_index.get(), group.first, group.second, p_vectorSet, p_begin, m_pendingBatch[next++]);
+            m_pendingBatchEnd = p_begin + p_vectorSet->Count();
             return ErrorCode::Success;
         }
 
@@ -1776,6 +1779,8 @@ namespace SPTAG::SPANN {
         // and one new head per part that does not keep the old one.
         ErrorCode CommitBatch(VectorIndex* p_index)
         {
+            if (m_pendingBatchEnd < 0 || m_pendingBatchEnd != m_versionMap->GetVectorNum())
+                throw std::runtime_error("SPFresh batch commit has no plan for the reserved vectors");
             for (BatchPosting& plan : m_pendingBatch)
             {
                 SizeType headID = plan.headID;
@@ -1833,6 +1838,7 @@ namespace SPTAG::SPANN {
                 m_stat.m_splitNum += (int)plan.pieces.size() - 1;
             }
             m_pendingBatch.clear();
+            m_pendingBatchEnd = -1;
             return ErrorCode::Success;
         }
 
