@@ -1674,19 +1674,34 @@ namespace SPTAG::SPANN {
             }
         }
 
-        // Adds the batch members chosen for one posting. The posting is read once, cleared of deleted and
-        // stale records, and written back; when it no longer fits it is split in memory into as many
-        // postings as it needs, each written once. Returns false when the head no longer exists.
-        bool MergeBatchIntoPosting(VectorIndex* p_index, SizeType headID, const std::vector<SizeType>& p_members,
-            std::shared_ptr<VectorSet>& p_vectorSet, SizeType p_begin)
+        struct BatchPosting
         {
-            std::unique_lock<std::shared_timed_mutex> lock(m_rwLocks[headID]);
-            if (!p_index->ContainSample(headID)) return false;
+            SizeType headID;
+            int appended;
+            // The rewritten posting when everything still fits in one.
+            std::string whole;
+            // Otherwise the parts it was split into, each with the centre that becomes its head.
+            std::vector<BatchPiece> pieces;
+            std::vector<std::string> pieceLists;
+        };
 
+        // The batch that PrepareBatch planned and CommitBatch has not written yet. One maintenance thread
+        // prepares and commits, so there is never more than one.
+        std::vector<BatchPosting> m_pendingBatch;
+
+        // Plans the new content of one posting that receives batch members. It reads the posting, drops
+        // deleted and stale records, adds the members and, when the result no longer fits, splits it in
+        // memory into as many postings as it needs. Nothing is written.
+        void PrepareBatchPosting(VectorIndex* p_index, SizeType headID, const std::vector<SizeType>& p_members,
+            std::shared_ptr<VectorSet>& p_vectorSet, SizeType p_begin, BatchPosting& p_plan)
+        {
             std::string postingList;
-            if (db->Get(headID, &postingList) != ErrorCode::Success) {
-                LOG(Helper::LogLevel::LL_Info, "Batch append fail to get posting %d\n", headID);
-                throw std::runtime_error("SPFresh mutable posting operation failed");
+            {
+                std::shared_lock<std::shared_timed_mutex> lock(m_rwLocks[headID]);
+                if (db->Get(headID, &postingList) != ErrorCode::Success) {
+                    LOG(Helper::LogLevel::LL_Info, "Batch append fail to get posting %d\n", headID);
+                    throw std::runtime_error("SPFresh mutable posting operation failed");
+                }
             }
             std::string combined;
             combined.reserve(postingList.size() + p_members.size() * m_vectorInfoSize);
@@ -1706,98 +1721,118 @@ namespace SPTAG::SPANN {
                 combined.resize(offset + m_vectorInfoSize);
                 Serialize(&combined[offset], VID, m_versionMap->GetVersion(VID), p_vectorSet->GetVector(member));
             }
+            p_plan.headID = headID;
+            p_plan.appended = (int)p_members.size();
             SizeType total = (SizeType)(combined.size() / m_vectorInfoSize);
-            m_stat.m_appendTaskNum += (int)p_members.size();
             if (total <= m_postingSizeLimit)
             {
-                m_postingSizes.UpdateSize(headID, total);
-                if (db->Put(headID, combined) != ErrorCode::Success) {
-                    LOG(Helper::LogLevel::LL_Info, "Batch append fail to write posting %d\n", headID);
-                    throw std::runtime_error("SPFresh mutable posting operation failed");
-                }
-                return true;
+                p_plan.whole = std::move(combined);
+                return;
             }
 
             COMMON::Dataset<ValueType> sample(total, m_opt->m_dim, p_index->m_iDataBlockSize, p_index->m_iDataCapacity, (const void*)combined.data(), true, nullptr, m_metaDataSize, m_vectorInfoSize);
             std::vector<SizeType> indices(total);
             std::iota(indices.begin(), indices.end(), 0);
-            std::vector<BatchPiece> pieces;
-            BisectInMemory(p_index, sample, indices, 0, total, pieces);
-
-            bool keptHead = false;
-            for (const BatchPiece& piece : pieces)
+            BisectInMemory(p_index, sample, indices, 0, total, p_plan.pieces);
+            p_plan.pieceLists.reserve(p_plan.pieces.size());
+            for (const BatchPiece& piece : p_plan.pieces)
             {
-                SizeType count = piece.last - piece.first;
-                std::string pieceList(static_cast<size_t>(count) * m_vectorInfoSize, '\0');
+                std::string pieceList(static_cast<size_t>(piece.last - piece.first) * m_vectorInfoSize, '\0');
                 char* ptr = &pieceList[0];
                 for (SizeType j = piece.first; j < piece.last; ++j, ptr += m_vectorInfoSize)
                     memcpy(ptr, combined.data() + static_cast<size_t>(indices[j]) * m_vectorInfoSize, m_vectorInfoSize);
-
-                if (!keptHead && p_index->ComputeDistance(piece.center.data(), p_index->GetSample(headID)) < Epsilon)
-                {
-                    keptHead = true;
-                    if (db->Put(headID, pieceList) != ErrorCode::Success) {
-                        LOG(Helper::LogLevel::LL_Info, "Batch append fail to override posting %d\n", headID);
-                        throw std::runtime_error("SPFresh mutable posting operation failed");
-                    }
-                    m_postingSizes.UpdateSize(headID, count);
-                    continue;
-                }
-                int begin, end = 0;
-                if (m_opt->m_liveHeadLimit > 0 && p_index->GetNumSamples() >= m_opt->m_liveHeadLimit)
-                    throw std::runtime_error("SPFresh centroid growth exceeds live memory budget");
-                p_index->AddIndexId(piece.center.data(), 1, m_opt->m_dim, begin, end);
-                if (db->Put(begin, pieceList) != ErrorCode::Success) {
-                    LOG(Helper::LogLevel::LL_Info, "Batch append fail to add posting %d\n", begin);
-                    throw std::runtime_error("SPFresh mutable posting operation failed");
-                }
-                p_index->AddIndexIdx(begin, end);
-                {
-                    std::lock_guard<std::mutex> tmplock(m_dataAddLock);
-                    if (m_postingSizes.AddBatch(1) == ErrorCode::MemoryOverFlow) {
-                        LOG(Helper::LogLevel::LL_Info, "MemoryOverFlow: new head %d, Map Size:%d\n", begin, m_postingSizes.BufferSize());
-                        throw std::runtime_error("SPFresh mutable index capacity exceeded");
-                    }
-                }
-                m_postingSizes.UpdateSize(begin, count);
+                p_plan.pieceLists.push_back(std::move(pieceList));
             }
-            if (!keptHead)
-            {
-                p_index->DeleteIndex(headID);
-                m_postingSizes.UpdateSize(headID, 0);
-            }
-            m_stat.m_splitNum += (int)pieces.size() - 1;
-            return true;
         }
 
-        // Appends a batch of new vectors whose postings were chosen with SelectHeads. Members of the same
-        // posting are added together, so a burst of nearby vectors costs one read and a few writes per
-        // posting instead of a split per vector.
-        ErrorCode AddIndexBatch(std::shared_ptr<VectorSet>& p_vectorSet, std::shared_ptr<VectorIndex> p_index, SizeType p_begin,
-            const SizeType* p_heads, int p_replicas)
+        // Plans a batch of new vectors: chooses up to p_replicas postings for each, groups the vectors by
+        // posting and works out what every touched posting becomes. It only reads, so it may run while
+        // searches do; the vectors must already have their entries in the version map.
+        ErrorCode PrepareBatch(std::shared_ptr<VectorSet>& p_vectorSet, std::shared_ptr<VectorIndex> p_index, SizeType p_begin, int p_replicas)
         {
+            m_pendingBatch.clear();
             std::map<SizeType, std::vector<SizeType>> groups;
+            std::vector<SizeType> heads(static_cast<size_t>(p_replicas));
             for (SizeType v = 0; v < p_vectorSet->Count(); ++v)
             {
-                for (int r = 0; r < p_replicas; ++r)
+                SelectHeads(p_vectorSet->GetVector(v), p_index.get(), p_replicas, heads.data());
+                int placed = 0;
+                for (int r = 0; r < p_replicas && heads[static_cast<size_t>(r)] >= 0; ++r)
                 {
-                    SizeType headID = p_heads[static_cast<size_t>(v) * p_replicas + r];
-                    if (headID < 0) break;
-                    groups[headID].push_back(v);
+                    if (!p_index->ContainSample(heads[static_cast<size_t>(r)])) continue;
+                    groups[heads[static_cast<size_t>(r)]].push_back(v);
+                    ++placed;
                 }
+                if (placed == 0) throw std::runtime_error("SPFresh batch append found no posting for a vector");
             }
-            std::vector<SizeType> retry(static_cast<size_t>(p_replicas));
+            m_pendingBatch.resize(groups.size());
+            size_t next = 0;
             for (auto& group : groups)
+                PrepareBatchPosting(p_index.get(), group.first, group.second, p_vectorSet, p_begin, m_pendingBatch[next++]);
+            return ErrorCode::Success;
+        }
+
+        // Writes the batch that PrepareBatch planned: one write per posting or per part of a split posting,
+        // and one new head per part that does not keep the old one.
+        ErrorCode CommitBatch(VectorIndex* p_index)
+        {
+            for (BatchPosting& plan : m_pendingBatch)
             {
-                if (MergeBatchIntoPosting(p_index.get(), group.first, group.second, p_vectorSet, p_begin)) continue;
-                for (SizeType member : group.second)
+                SizeType headID = plan.headID;
+                std::unique_lock<std::shared_timed_mutex> lock(m_rwLocks[headID]);
+                if (!p_index->ContainSample(headID)) throw std::runtime_error("SPFresh batch append lost a posting between planning and writing");
+                m_stat.m_appendTaskNum += plan.appended;
+                if (plan.pieces.empty())
                 {
-                    SelectHeads(p_vectorSet->GetVector(member), p_index.get(), p_replicas, retry.data());
-                    std::vector<SizeType> single(1, member);
-                    if (retry[0] < 0 || !MergeBatchIntoPosting(p_index.get(), retry[0], single, p_vectorSet, p_begin))
-                        throw std::runtime_error("SPFresh batch append found no posting for a vector");
+                    m_postingSizes.UpdateSize(headID, (int)(plan.whole.size() / m_vectorInfoSize));
+                    if (db->Put(headID, plan.whole) != ErrorCode::Success) {
+                        LOG(Helper::LogLevel::LL_Info, "Batch append fail to write posting %d\n", headID);
+                        throw std::runtime_error("SPFresh mutable posting operation failed");
+                    }
+                    continue;
                 }
+                bool keptHead = false;
+                for (size_t k = 0; k < plan.pieces.size(); ++k)
+                {
+                    const BatchPiece& piece = plan.pieces[k];
+                    const std::string& pieceList = plan.pieceLists[k];
+                    SizeType count = piece.last - piece.first;
+                    if (!keptHead && p_index->ComputeDistance(piece.center.data(), p_index->GetSample(headID)) < Epsilon)
+                    {
+                        keptHead = true;
+                        if (db->Put(headID, pieceList) != ErrorCode::Success) {
+                            LOG(Helper::LogLevel::LL_Info, "Batch append fail to override posting %d\n", headID);
+                            throw std::runtime_error("SPFresh mutable posting operation failed");
+                        }
+                        m_postingSizes.UpdateSize(headID, count);
+                        continue;
+                    }
+                    int begin, end = 0;
+                    if (m_opt->m_liveHeadLimit > 0 && p_index->GetNumSamples() >= m_opt->m_liveHeadLimit)
+                        throw std::runtime_error("SPFresh centroid growth exceeds live memory budget");
+                    p_index->AddIndexId(piece.center.data(), 1, m_opt->m_dim, begin, end);
+                    if (db->Put(begin, pieceList) != ErrorCode::Success) {
+                        LOG(Helper::LogLevel::LL_Info, "Batch append fail to add posting %d\n", begin);
+                        throw std::runtime_error("SPFresh mutable posting operation failed");
+                    }
+                    p_index->AddIndexIdx(begin, end);
+                    {
+                        std::lock_guard<std::mutex> tmplock(m_dataAddLock);
+                        if (m_postingSizes.AddBatch(1) == ErrorCode::MemoryOverFlow) {
+                            LOG(Helper::LogLevel::LL_Info, "MemoryOverFlow: new head %d, Map Size:%d\n", begin, m_postingSizes.BufferSize());
+                            throw std::runtime_error("SPFresh mutable index capacity exceeded");
+                        }
+                    }
+                    m_postingSizes.UpdateSize(begin, count);
+                }
+                if (!keptHead)
+                {
+                    p_index->DeleteIndex(headID);
+                    m_postingSizes.UpdateSize(headID, 0);
+                }
+                m_stat.m_splitNum += (int)plan.pieces.size() - 1;
             }
+            m_pendingBatch.clear();
             return ErrorCode::Success;
         }
 
