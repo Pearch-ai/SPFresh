@@ -591,10 +591,11 @@ namespace SPTAG::SPANN {
                         m_stat.m_theSameHeadNum++;
                     }
                     else {
-                        int begin, end = 0;
+                        int begin = -1, end = 0;
                         if (m_opt->m_liveHeadLimit > 0 && p_index->GetNumSamples() >= m_opt->m_liveHeadLimit)
                             throw std::runtime_error("SPFresh centroid growth exceeds live memory budget");
-                        p_index->AddIndexId(args.centers + k * args._D, 1, m_opt->m_dim, begin, end);
+                        if (p_index->AddIndexId(args.centers + k * args._D, 1, m_opt->m_dim, begin, end) != ErrorCode::Success || begin < 0)
+                            throw std::runtime_error("SPFresh could not add a centroid for a split posting");
                         newHeadVID = begin;
                         newHeadsID.push_back(begin);
                         auto splitPutBegin = std::chrono::high_resolution_clock::now();
@@ -606,7 +607,8 @@ namespace SPTAG::SPANN {
                         elapsedMSeconds = std::chrono::duration_cast<std::chrono::microseconds>(splitPutEnd - splitPutBegin).count();
                         m_stat.m_putCost += elapsedMSeconds;
                         auto updateHeadBegin = std::chrono::high_resolution_clock::now();
-                        p_index->AddIndexIdx(begin, end);
+                        if (p_index->AddIndexIdx(begin, end) != ErrorCode::Success)
+                        throw std::runtime_error("SPFresh could not link a new centroid into the head index");
                         auto updateHeadEnd = std::chrono::high_resolution_clock::now();
                         elapsedMSeconds = std::chrono::duration_cast<std::chrono::milliseconds>(updateHeadEnd - updateHeadBegin).count();
                         m_stat.m_updateHeadCost += elapsedMSeconds;
@@ -1812,15 +1814,17 @@ namespace SPTAG::SPANN {
                         m_postingSizes.UpdateSize(headID, count);
                         continue;
                     }
-                    int begin, end = 0;
+                    int begin = -1, end = 0;
                     if (m_opt->m_liveHeadLimit > 0 && p_index->GetNumSamples() >= m_opt->m_liveHeadLimit)
                         throw std::runtime_error("SPFresh centroid growth exceeds live memory budget");
-                    p_index->AddIndexId(piece.center.data(), 1, m_opt->m_dim, begin, end);
+                    if (p_index->AddIndexId(piece.center.data(), 1, m_opt->m_dim, begin, end) != ErrorCode::Success || begin < 0)
+                        throw std::runtime_error("SPFresh could not add a centroid for a split posting");
                     if (db->Put(begin, pieceList) != ErrorCode::Success) {
                         LOG(Helper::LogLevel::LL_Info, "Batch append fail to add posting %d\n", begin);
                         throw std::runtime_error("SPFresh mutable posting operation failed");
                     }
-                    p_index->AddIndexIdx(begin, end);
+                    if (p_index->AddIndexIdx(begin, end) != ErrorCode::Success)
+                        throw std::runtime_error("SPFresh could not link a new centroid into the head index");
                     {
                         std::lock_guard<std::mutex> tmplock(m_dataAddLock);
                         if (m_postingSizes.AddBatch(1) == ErrorCode::MemoryOverFlow) {
